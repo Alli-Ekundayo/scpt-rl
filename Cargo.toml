@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["rust/pcb_parser", "rust/pcb_router"]
+members = ["rust/kicad_parser", "rust/pcb_parser", "rust/pcb_router"]
 
 [profile.release]
 opt-level = 3
