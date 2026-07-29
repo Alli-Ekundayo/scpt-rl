@@ -10,6 +10,8 @@ use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
+pub mod adapter;
+
 // ---------------------------------------------------------------------------
 // Geometric primitives
 // ---------------------------------------------------------------------------
