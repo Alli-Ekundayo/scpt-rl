@@ -533,7 +533,7 @@ class PPOEALTrainer:
         sigma = self.cfg.sigma
 
         # Old log-probs (stored at collection time).
-        old_log_probs = torch.stack(self.buffer.log_probs)
+        old_log_probs = torch.stack(self.buffer.log_probs).detach()
         T = len(self.buffer)
 
         # PPO epochs.
