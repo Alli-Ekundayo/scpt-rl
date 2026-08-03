@@ -143,8 +143,8 @@ def compute_gae(
         advantages: (T,)
     """
     T = rewards.shape[0]
-    advantages = torch.zeros(T, dtype=rewards.dtype)
-    last_gae = 0.0
+    advantages = torch.zeros(T, dtype=rewards.dtype, device=rewards.device)
+    last_gae = torch.zeros((), dtype=rewards.dtype, device=rewards.device)
     for t in reversed(range(T)):
         next_v = next_value if t == T - 1 else values[t + 1]
         next_non_terminal = 1.0 - dones[t]
@@ -436,14 +436,14 @@ class PPOEALTrainer:
     ) -> torch.Tensor:
         """Compute GAE for the reward signal."""
         T = len(self.buffer)
-        rewards = torch.tensor(self.buffer.rewards, dtype=torch.float32)
+        rewards = torch.tensor(self.buffer.rewards, dtype=torch.float32, device=self.device)
         values = torch.tensor(
-            [v["reward"].item() for v in self.buffer.values], dtype=torch.float32
+            [v["reward"].item() for v in self.buffer.values], dtype=torch.float32, device=self.device
         )
         dones = torch.tensor(
-            [float(d) for d in self.buffer.dones], dtype=torch.float32
+            [float(d) for d in self.buffer.dones], dtype=torch.float32, device=self.device
         )
-        return compute_gae(rewards, values, dones, next_value, gamma, gae_lambda)
+        return compute_gae(rewards, values, dones, next_value.to(device=self.device), gamma, gae_lambda)
 
     def _compute_constraint_gae(
         self,
@@ -465,6 +465,7 @@ class PPOEALTrainer:
         costs_t = torch.tensor(
             [step.get(constraint_name, 0.0) for step in self.buffer.costs],
             dtype=torch.float32,
+            device=self.device,
         )
         # Use the constraint critic value head.
         values = torch.tensor(
@@ -583,7 +584,7 @@ class PPOEALTrainer:
         self.dual_updater.update(phi_c_estimates)
 
         return {
-            "reward_mean": float(torch.tensor(self.buffer.rewards).mean()),
+            "reward_mean": float(torch.tensor(self.buffer.rewards, device=self.device).mean()),
             "phi_c": phi_c_estimates,
             "policy_loss": total_policy_loss,
             "lambdas": self.dual_updater.lambdas,
