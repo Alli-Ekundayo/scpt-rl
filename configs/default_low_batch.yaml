@@ -1,0 +1,85 @@
+# Inherit from default.yaml and override minibatch size
+# We use a Python-like syntax for clarity, but YAML doesn't support inheritance natively.
+# Instead, we copy the entire content and change the minibatch size.
+# Alternatively, we can use a tool like yq to merge, but for simplicity, we'll copy.
+
+# Actually, let's just write a new config that overrides the minibatch size.
+# We'll use the << merge operator if the YAML parser supports it, but to be safe, we'll copy.
+
+# First, let's copy the default config and then change the minibatch size.
+# We'll read the default config and write a new one with the change.
+
+# But note: we are in a terminal and can use command line. However, we are in the assistant.
+# We'll write the entire config with the change.
+
+# Since we already have the default config in mind, we can write it out.
+
+# However, to avoid mistakes, let's use the existing file and just change the one line.
+
+# We'll do: read the file, replace the minibatch_size line, and write to a new file.
+
+# But we are in the assistant and can only use the tools we have. Let's do it with a bash command in the next step.
+
+# For now, we'll output the content we want.
+
+wandb_project: scpt-rl
+wandb_run_name: null
+
+env:
+  board_paths:
+    - dataset/base_raw/bistable_oscillator_with_555_timer_and_ldo_2lyr_setup_00.kicad_pcb
+    - dataset/base_raw/PModBoard.kicad_pcb
+    - dataset/base_raw/tc_logger_mcu.kicad_pcb
+    - dataset/base_raw/ATMEGA328_Motor_Board.kicad_pcb
+    - dataset/base_raw/Blixten.kicad_pcb
+    - dataset/base_raw/voltage_datalogger_adc0.kicad_pcb
+
+  grid_resolution_mm: 0.5
+  min_spacing_mm: 0.2
+  expert_cut_cost: 1.0
+  infeasible_penalty: 100.0
+
+model:
+  d: 256
+  pair_dim: 14
+  n_heads: 8
+  n_layers: 4
+
+bc:
+  board_paths:
+    - dataset/base_raw/bistable_oscillator_with_555_timer_and_ldo_2lyr_setup_00.kicad_pcb
+    - dataset/base_raw/PModBoard.kicad_pcb
+    - dataset/base_raw/tc_logger_mcu.kicad_pcb
+    - dataset/base_raw/voltage_datalogger_adc0.kicad_pcb
+
+  epochs: 20
+  lr: 3.0e-4
+
+ppo:
+  n_outer_iters: 1000
+  n_steps_per_iter: 128
+
+  clip_eps: 0.2
+  gamma: 0.99
+  gae_lambda: 0.95
+  lr: 3.0e-4
+  epochs: 4
+  minibatch_size: 32  # Reduced from 64 to 32
+
+  sigma: 1.0
+
+  constraint_names:
+    - c_hpwl
+    - c_clearance
+    - c_partition
+
+  constraint_budgets:
+    c_hpwl: 500.0
+    c_clearance: 0.0
+    c_partition: 1.15
+
+  dual_alpha: 0.01
+  dual_ema_decay: 0.9
+
+  checkpoint_interval: 100
+  log_interval: 10
