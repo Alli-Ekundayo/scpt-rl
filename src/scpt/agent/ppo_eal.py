@@ -462,11 +462,15 @@ class PPOEALTrainer:
                 design_json = json.dumps(design)
 
             # Store reconstruction format (compact)
+            z_star_cpu = z_star.cpu()
+            Z_placed_cpu = Z_placed.cpu()
             return {
                 "design_json": design_json,
                 "active_idx": active_idx,
                 "placed_indices": placed_indices,
                 # Store these tensors on CPU for immediate use during rollout collection
+                "z_star": z_star_cpu,
+                "Z_placed": Z_placed_cpu,
                 "action_mask": prepared["action_mask"].cpu(),
                 "grid_xy": prepared["grid_xy"].cpu(),
                 "F_pair": F_pair.cpu(),
