@@ -385,7 +385,9 @@ class PPOEALTrainer:
         if active_idx is None:
             return prepared
 
-        z_comp_all, z_star, Z_placed = encode_design(design, self.encoder, active_idx, placed_indices)
+        with torch.no_grad():
+            z_comp_all, z_star, Z_placed = encode_design(design, self.encoder, active_idx, placed_indices)
+
         F_pair = torch.zeros((len(placed_indices), self.cfg.pair_dim), dtype=torch.float32, device=self.device)
         try:
             from scpt.training.data import build_pair_features
@@ -399,13 +401,13 @@ class PPOEALTrainer:
             pass
 
         prepared.update({
-            "z_comp_all": z_comp_all,
-            "z_star": z_star,
-            "Z_placed": Z_placed,
+            "z_comp_all": z_comp_all.detach(),
+            "z_star": z_star.detach(),
+            "Z_placed": Z_placed.detach(),
             "F_pair": F_pair,
         })
         return prepared
-
+    
     def _to_tensor_obs(self, obs: dict) -> dict:
         prepared = dict(obs)
         for key, value in obs.items():
