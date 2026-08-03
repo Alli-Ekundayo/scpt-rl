@@ -1,3 +1,35 @@
+# ── SCPT-RL project-specific ─────────────────────────────────────────────
+
+# Training run artefacts (checkpoints, logs, plots)
+runs/
+plots/
+wandb/
+
+# Evaluation output
+results/
+
+# Built Rust wheels and compiled artefacts
+*.whl
+target/
+dist-info/
+
+# Compiled Rust binaries used by maturin develop
+*.so
+*.pyd
+
+# Editor / tool dirs
+.idea/
+.vscode/
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Local secrets / keys
+*.pem
+
+# ── Generic Python (template) ────────────────────────────────────────────
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -151,8 +183,8 @@ activemq-data/
 .env
 .envrc
 .venv
-env/
-venv/
+/env/
+/venv/
 ENV/
 env.bak/
 venv.bak/

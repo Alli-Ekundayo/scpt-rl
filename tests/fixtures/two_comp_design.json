@@ -1,0 +1,70 @@
+{
+  "board": {
+    "bounds": { "x": 0.0, "y": 0.0, "w": 100.0, "h": 100.0 },
+    "thickness_mm": 1.6
+  },
+  "components": [
+    {
+      "ref_des": "R1",
+      "value": "10k",
+      "footprint": {
+        "library": "Resistor_SMD",
+        "name": "R_0805",
+        "courtyard": {
+          "points": [
+            [-1.65, -0.95], [1.65, -0.95], [1.65, 0.95], [-1.65, 0.95]
+          ]
+        },
+        "pads": [
+          { "number": "1", "local_pos": [-1.0, 0.0], "net_name": "VCC",
+            "type": "smd", "electrical_proxy_confidence": 0.9 },
+          { "number": "2", "local_pos": [1.0, 0.0], "net_name": "SIG",
+            "type": "smd", "electrical_proxy_confidence": 0.9 }
+        ]
+      },
+      "layer": "F.Cu"
+    },
+    {
+      "ref_des": "C1",
+      "value": "100nF",
+      "footprint": {
+        "library": "Capacitor_SMD",
+        "name": "C_0805",
+        "courtyard": {
+          "points": [
+            [-1.45, -0.95], [1.45, -0.95], [1.45, 0.95], [-1.45, 0.95]
+          ]
+        },
+        "pads": [
+          { "number": "1", "local_pos": [-0.5, 0.0], "net_name": "VCC",
+            "type": "smd", "electrical_proxy_confidence": 0.9 },
+          { "number": "2", "local_pos": [0.5, 0.0], "net_name": "GND",
+            "type": "smd", "electrical_proxy_confidence": 0.9 }
+        ]
+      },
+      "layer": "F.Cu"
+    }
+  ],
+  "nets": [
+    { "name": "VCC",  "role": "power",  "role_confidence": 0.95, "pads": [[0, "1"], [1, "1"]] },
+    { "name": "GND",  "role": "ground", "role_confidence": 0.95, "pads": [[1, "2"]] },
+    { "name": "SIG",  "role": "signal", "role_confidence": 0.85, "pads": [[0, "2"]] }
+  ],
+  "placement": {
+    "placement_order": [0, 1],
+    "positions": [
+      {
+        "component_idx": 0,
+        "position": [10.0, 20.0],
+        "rotation_deg": 90.0,
+        "bottom_layer": false
+      },
+      {
+        "component_idx": 1,
+        "position": [15.0, 20.0],
+        "rotation_deg": 0.0,
+        "bottom_layer": false
+      }
+    ]
+  }
+}
