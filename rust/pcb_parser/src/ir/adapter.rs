@@ -9,13 +9,13 @@ use std::collections::HashMap;
 
 use kicad_parser::{
     BoardOutput, ComponentRecord, ElectricalPinType, KeepoutZoneRecord, NetCategory, NetRecord,
-    PinRecord, PinReference, Point2D,
+    PinRecord, Point2D,
 };
 
 use super::{
     BoardGeometry, Component, Footprint, Keepout, Layer, LayerSet, Net, NetRole, Netclass, Pad,
-    PadRef, PadShape, PartitionSpec, PcbDesign, PinElectricalProxy, Placement, PlacementState,
-    Polygon, Rect, Vec2,
+    PadRef, PadShape, PcbDesign, PinElectricalProxy, Placement, PlacementState, Polygon, Rect,
+    Vec2,
 };
 
 // ---------------------------------------------------------------------------
@@ -181,7 +181,7 @@ fn rect_from_bbox(bb: &kicad_parser::BoundingBox) -> Rect {
     }
 }
 
-fn layer_set_from_keepout(kz: &KeepoutZoneRecord) -> LayerSet {
+fn layer_set_from_keepout(_kz: &KeepoutZoneRecord) -> LayerSet {
     let mut s = std::collections::BTreeSet::new();
     // Keepout zones typically apply to all layers; represent as F_Cu + B_Cu
     // (a proper "all layers" representation would need a richer type).

@@ -392,9 +392,9 @@ class PPOEALTrainer:
 
             pair_features = build_pair_features(design, active_idx, placed_indices)
             if pair_features.shape[-1] == self.cfg.pair_dim:
-                F_pair = pair_features
+                F_pair = pair_features.to(device=self.device)
             elif pair_features.numel() > 0:
-                F_pair = pair_features[:, : self.cfg.pair_dim]
+                F_pair = pair_features[:, : self.cfg.pair_dim].to(device=self.device)
         except Exception:
             pass
 

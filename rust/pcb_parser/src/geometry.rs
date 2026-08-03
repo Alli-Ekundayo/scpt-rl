@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 
-use crate::ir::{PadRef, PcbDesign, PartitionSpec, Placement, PlacementState, Vec2};
+use crate::ir::{PadRef, PcbDesign, PartitionSpec, Placement, Vec2};
 
 // ---------------------------------------------------------------------------
 // Coordinate helpers

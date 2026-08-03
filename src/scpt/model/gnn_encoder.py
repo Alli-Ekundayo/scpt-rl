@@ -158,7 +158,11 @@ def encode_design(
         z_star: (d,) embedding for the active component.
         Z_placed: (P, d) embeddings for already placed components.
     """
-    node_features = build_node_features(design)
+    device = next(encoder.parameters()).device
+    node_features = {
+        name: feats.to(device=device)
+        for name, feats in build_node_features(design).items()
+    }
     encoded = encoder(node_features)
     z_comp_all = encoded["component"]
 
