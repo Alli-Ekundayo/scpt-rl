@@ -29,6 +29,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
+import json
 
 import numpy as np
 import torch
@@ -330,9 +331,27 @@ class PPOEALTrainer:
     @torch.no_grad()
     def _sample_action(self, obs: dict) -> tuple[int, torch.Tensor]:
         """Sample an action from the policy. Returns (action_int, log_prob)."""
-        z_star = obs.get("z_star", torch.zeros(self.cfg.d, dtype=torch.float32, device=self.device))
-        Z_placed = obs.get("Z_placed", torch.zeros(0, self.cfg.d, dtype=torch.float32, device=self.device))
-        F_pair = obs.get("F_pair", torch.zeros(0, self.cfg.pair_dim, dtype=torch.float32, device=self.device))
+        # Handle both old format (precomputed tensors) and new format (reconstruction data)
+        z_star = obs.get("z_star")
+        Z_placed = obs.get("Z_placed")
+        design_json = obs.get("design_json")
+        active_idx = obs.get("active_idx")
+        placed_indices = obs.get("placed_indices")
+        F_pair = obs.get("F_pair")
+
+        # If we have precomputed tensors (old format), use them directly
+        if z_star is not None and torch.is_tensor(z_star) and Z_placed is not None and torch.is_tensor(Z_placed):
+            pass  # Use the precomputed values
+        # If we have reconstruction data (new format), compute tensors on demand
+        elif design_json is not None and active_idx is not None and placed_indices is not None:
+            design = json.loads(design_json)
+            _, z_star, Z_placed = encode_design(design, self.encoder, active_idx, placed_indices)
+        else:
+            # Fallback to defaults
+            z_star = torch.zeros(self.cfg.d, dtype=torch.float32, device=self.device)
+            Z_placed = torch.zeros(0, self.cfg.d, dtype=torch.float32, device=self.device)
+
+        F_pair = F_pair if F_pair is not None else torch.zeros(0, self.cfg.pair_dim, dtype=torch.float32, device=self.device)
         grid_xy = obs["grid_xy"]
         action_mask = obs["action_mask"]
 
@@ -346,11 +365,27 @@ class PPOEALTrainer:
         self, obs: dict
     ) -> dict[str, torch.Tensor]:
         """Estimate V(s) for the reward and each constraint."""
+        # Handle both old format (precomputed tensors) and new format (reconstruction data)
         z_comp_all = obs.get("z_comp_all")
+        design_json = obs.get("design_json")
+        active_idx = obs.get("active_idx")
+        placed_indices = obs.get("placed_indices")
+
+        # If we have precomputed tensors (old format), use them directly
         if z_comp_all is not None and torch.is_tensor(z_comp_all) and z_comp_all.shape[0] > 0:
             return self.value_heads(z_comp_all)
+
+        # If we have reconstruction data (new format), compute tensors on demand
+        if design_json is not None and active_idx is not None and placed_indices is not None:
+            design = json.loads(design_json)
+            z_comp_all, _, Z_placed = encode_design(design, self.encoder, active_idx, placed_indices)
+            # If no components placed yet, use a dummy single-node embedding.
+            if Z_placed.shape[0] == 0:
+                Z_placed = torch.zeros(1, self.cfg.d, device=self.device)
+            return self.value_heads(Z_placed)
+
+        # Fallback: minimal Z_placed
         Z_placed = obs.get("Z_placed", torch.zeros(0, self.cfg.d, device=self.device))
-        # If no components placed yet, use a dummy single-node embedding.
         if Z_placed.shape[0] == 0:
             Z_placed = torch.zeros(1, self.cfg.d, device=self.device)
         return self.value_heads(Z_placed)
@@ -400,10 +435,16 @@ class PPOEALTrainer:
         except Exception:
             pass
 
+        # Store minimal reconstruction data instead of full embeddings to prevent O(T^2) memory growth
+        # We'll store design_json and the indices needed to reconstruct embeddings during PPO update
+        design_json = None
+        if design is not None:
+            design_json = json.dumps(design)
+
         prepared.update({
-            "z_comp_all": z_comp_all.detach(),
-            "z_star": z_star.detach(),
-            "Z_placed": Z_placed.detach(),
+            "design_json": design_json,
+            "active_idx": active_idx,
+            "placed_indices": placed_indices,
             "F_pair": F_pair,
         })
         return prepared
@@ -553,9 +594,28 @@ class PPOEALTrainer:
                 for i in idx:
                     i = i.item()
                     obs_i = self.buffer.obs_list[i]
-                    z_star = obs_i.get("z_star", torch.zeros(self.cfg.d, device=self.device))
-                    Z_placed = obs_i.get("Z_placed", torch.zeros(0, self.cfg.d, device=self.device))
-                    F_pair = obs_i.get("F_pair", torch.zeros(0, self.cfg.pair_dim, device=self.device))
+
+                    # Handle both old format (precomputed tensors) and new format (reconstruction data)
+                    z_star = obs_i.get("z_star")
+                    Z_placed = obs_i.get("Z_placed")
+                    design_json = obs_i.get("design_json")
+                    active_idx = obs_i.get("active_idx")
+                    placed_indices = obs_i.get("placed_indices")
+                    F_pair = obs_i.get("F_pair")
+
+                    # If we have precomputed tensors (old format), use them directly
+                    if z_star is not None and torch.is_tensor(z_star) and Z_placed is not None and torch.is_tensor(Z_placed):
+                        pass  # Use the precomputed values
+                    # If we have reconstruction data (new format), compute tensors on demand
+                    elif design_json is not None and active_idx is not None and placed_indices is not None:
+                        design = json.loads(design_json)
+                        _, z_star, Z_placed = encode_design(design, self.encoder, active_idx, placed_indices)
+                    else:
+                        # Fallback to defaults
+                        z_star = torch.zeros(self.cfg.d, device=self.device)
+                        Z_placed = torch.zeros(0, self.cfg.d, device=self.device)
+
+                    F_pair = F_pair if F_pair is not None else torch.zeros(0, self.cfg.pair_dim, device=self.device)
                     grid_xy = obs_i["grid_xy"]
                     # Use stored mask — never recomputed.
                     mask = self.buffer.action_masks[i]
