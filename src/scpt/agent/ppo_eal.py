@@ -476,7 +476,7 @@ class PPOEALTrainer:
             [float(d) for d in self.buffer.dones], dtype=torch.float32
         )
         # Legal-action mask: verify actions were taken in legal cells.
-        legal_flags = torch.zeros(T)
+        legal_flags = torch.zeros(T, device=self.device)
         for t, (action, mask) in enumerate(zip(self.buffer.actions, self.buffer.action_masks)):
             mask_cpu = mask.detach().cpu()
             if action < len(mask_cpu) and float(mask_cpu[action]) > 0.5:
