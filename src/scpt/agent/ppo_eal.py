@@ -351,7 +351,11 @@ class PPOEALTrainer:
             z_star = torch.zeros(self.cfg.d, dtype=torch.float32, device=self.device)
             Z_placed = torch.zeros(0, self.cfg.d, dtype=torch.float32, device=self.device)
 
-        F_pair = F_pair if F_pair is not None else torch.zeros(0, self.cfg.pair_dim, dtype=torch.float32, device=self.device)
+        # Ensure F_pair is on the correct device (move from CPU if needed)
+        if F_pair is not None:
+            F_pair = F_pair.to(device=self.device)
+        else:
+            F_pair = torch.zeros(0, self.cfg.pair_dim, dtype=torch.float32, device=self.device)
         grid_xy = obs["grid_xy"]
         action_mask = obs["action_mask"]
 
@@ -437,6 +441,7 @@ class PPOEALTrainer:
 
         # Store minimal reconstruction data instead of full embeddings to prevent O(T^2) memory growth
         # We'll store design_json and the indices needed to reconstruct embeddings during PPO update
+        # Also store F_pair on CPU to save GPU memory in the buffer (will be moved to GPU when used)
         design_json = None
         if design is not None:
             design_json = json.dumps(design)
@@ -445,7 +450,7 @@ class PPOEALTrainer:
             "design_json": design_json,
             "active_idx": active_idx,
             "placed_indices": placed_indices,
-            "F_pair": F_pair,
+            "F_pair": F_pair.cpu(),  # Store on CPU to save GPU memory
         })
         return prepared
     
@@ -615,7 +620,11 @@ class PPOEALTrainer:
                         z_star = torch.zeros(self.cfg.d, device=self.device)
                         Z_placed = torch.zeros(0, self.cfg.d, device=self.device)
 
-                    F_pair = F_pair if F_pair is not None else torch.zeros(0, self.cfg.pair_dim, device=self.device)
+                    # Ensure F_pair is on the correct device (move from CPU if needed)
+                    if F_pair is not None:
+                        F_pair = F_pair.to(device=self.device)
+                    else:
+                        F_pair = torch.zeros(0, self.cfg.pair_dim, device=self.device)
                     grid_xy = obs_i["grid_xy"]
                     # Use stored mask — never recomputed.
                     mask = self.buffer.action_masks[i]
