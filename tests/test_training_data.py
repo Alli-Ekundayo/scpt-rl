@@ -5,6 +5,7 @@ import pytest
 
 from scpt.training.data import (
     area_descending_cluster_order,
+    build_pair_features,
     find_symmetry_pairs,
     functional_clusters,
 )
@@ -151,3 +152,25 @@ def test_symmetry_pairs_includes_matched_rc():
     ids = functional_clusters(design)
     pairs = find_symmetry_pairs(design, ids)
     assert ("R1", "R2") in pairs
+
+
+def test_build_pair_features_returns_14_dims():
+    design = _make_design(
+        components=[
+            _comp("U1", []),
+            _comp("U2", []),
+        ],
+        nets=[
+            _net("SIG", "signal", [(0, 0), (1, 0)]),
+        ],
+    )
+    design["placement"]["positions"] = [
+        {"component_idx": 0, "position": [10.0, 10.0], "rotation_deg": 0.0, "bottom_layer": False},
+        {"component_idx": 1, "position": [13.0, 14.0], "rotation_deg": 0.0, "bottom_layer": False},
+    ]
+
+    feats = build_pair_features(design, active_idx=0, placed_indices=[1])
+    assert feats.shape == (1, 14)
+    assert feats[0, 0].item() == 1.0
+    assert feats[0, 1].item() == 1.0
+    assert feats[0, 9].item() > 0.0

@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import torch
+
 
 # ---------------------------------------------------------------------------
 # Union-Find
@@ -196,3 +198,161 @@ def find_symmetry_pairs(
             seen_pairs.add(pair)
 
     return [tuple(p) for p in sorted(seen_pairs)]
+
+
+def build_pair_features(
+    design: dict[str, Any],
+    active_idx: int,
+    placed_indices: list[int],
+) -> torch.Tensor:
+    """Build the 14-dim live pair feature tensor used by the policy.
+
+    The features are intentionally simple and deterministic so they can be
+    computed directly from parsed board data at rollout time:
+    - shared net indicators split by role
+    - diff-pair partner flag
+    - same functional-cluster flag
+    - net-count / degree context
+    - relative geometry between the active component and each placed component
+    - netclass compatibility
+    """
+    if not placed_indices:
+        return torch.zeros((0, 14), dtype=torch.float32)
+
+    components = design.get("components", [])
+    nets = design.get("nets", [])
+    placement = design.get("placement", {})
+    cluster_ids = functional_clusters(design) if components else []
+
+    comp_net_info = _component_net_info(design)
+    diff_pair_map = {
+        net.get("name"): net.get("diff_pair_id")
+        for net in nets
+        if net.get("name")
+    }
+
+    active_nets = comp_net_info.get(active_idx, {})
+    active_net_names = set(active_nets)
+    active_role_counts = _net_role_counts(active_nets, nets)
+    active_pos = _component_position(design, active_idx)
+    board_scale = _board_scale(design)
+    active_netclass = (
+        _component_netclass(components[active_idx])
+        if 0 <= active_idx < len(components)
+        else None
+    )
+
+    out = torch.zeros((len(placed_indices), 14), dtype=torch.float32)
+    for row, placed_idx in enumerate(placed_indices):
+        if placed_idx >= len(components):
+            continue
+
+        placed_nets = comp_net_info.get(placed_idx, {})
+        placed_net_names = set(placed_nets)
+        shared_names = active_net_names & placed_net_names
+        placed_role_counts = _net_role_counts(placed_nets, nets)
+        placed_pos = _component_position(design, placed_idx)
+        dx = placed_pos[0] - active_pos[0]
+        dy = placed_pos[1] - active_pos[1]
+        manhattan = abs(dx) + abs(dy)
+        euclidean = (dx * dx + dy * dy) ** 0.5
+
+        shared_signal = _role_overlap(shared_names, nets, "signal")
+        shared_power = _role_overlap(shared_names, nets, "power")
+        shared_ground = _role_overlap(shared_names, nets, "ground")
+        shared_diff_pair = _diff_pair_overlap(active_net_names, placed_net_names, diff_pair_map)
+        same_cluster = 0.0
+        if 0 <= active_idx < len(cluster_ids) and 0 <= placed_idx < len(cluster_ids):
+            same_cluster = 1.0 if cluster_ids[active_idx] == cluster_ids[placed_idx] else 0.0
+        same_netclass = 1.0 if active_netclass and active_netclass == _component_netclass(components[placed_idx]) else 0.0
+
+        out[row] = torch.tensor(
+            [
+                1.0 if shared_names else 0.0,
+                shared_signal,
+                shared_power,
+                shared_ground,
+                shared_diff_pair,
+                same_cluster,
+                min(len(shared_names) / max(len(active_net_names | placed_net_names), 1), 1.0),
+                min(active_role_counts["signal"] / board_scale, 1.0),
+                min(placed_role_counts["signal"] / board_scale, 1.0),
+                manhattan / board_scale,
+                euclidean / board_scale,
+                dx / board_scale,
+                dy / board_scale,
+                same_netclass,
+            ],
+            dtype=torch.float32,
+        )
+    return out
+
+
+def _component_net_info(design: dict[str, Any]) -> dict[int, dict[str, dict[str, Any]]]:
+    """Map component index → net name → net metadata."""
+    comp_info: dict[int, dict[str, dict[str, Any]]] = {}
+    for net in design.get("nets", []):
+        net_name = net.get("name")
+        if not net_name:
+            continue
+        for pad_ref in net.get("pads", []):
+            if not isinstance(pad_ref, (list, tuple)) or len(pad_ref) < 1:
+                continue
+            comp_idx = int(pad_ref[0])
+            comp_info.setdefault(comp_idx, {})[net_name] = net
+    return comp_info
+
+
+def _component_position(design: dict[str, Any], component_idx: int) -> tuple[float, float]:
+    positions = design.get("placement", {}).get("positions", [])
+    if component_idx >= len(positions):
+        return 0.0, 0.0
+    pos = positions[component_idx]
+    if not pos:
+        return 0.0, 0.0
+    xy = pos.get("position", [0.0, 0.0])
+    return float(xy[0]), float(xy[1])
+
+
+def _board_scale(design: dict[str, Any]) -> float:
+    bounds = design.get("board", {}).get("bounds", {})
+    w = float(bounds.get("w", 1.0))
+    h = float(bounds.get("h", 1.0))
+    return max((w * w + h * h) ** 0.5, 1.0)
+
+
+def _component_netclass(component: dict[str, Any]) -> str | None:
+    netclass_hint = component.get("netclass_hint")
+    return str(netclass_hint) if netclass_hint is not None else None
+
+
+def _net_role_counts(nets_by_name: dict[str, dict[str, Any]], all_nets: list[dict[str, Any]]) -> dict[str, float]:
+    counts = {"signal": 0.0, "power": 0.0, "ground": 0.0}
+    for net_name in nets_by_name:
+        role = next((net.get("role") for net in all_nets if net.get("name") == net_name), "signal")
+        if role in counts:
+            counts[role] += 1.0
+    return counts
+
+
+def _role_overlap(shared_names: set[str], all_nets: list[dict[str, Any]], role: str) -> float:
+    for net in all_nets:
+        if net.get("name") in shared_names and net.get("role") == role:
+            return 1.0
+    return 0.0
+
+
+def _diff_pair_overlap(
+    active_net_names: set[str],
+    placed_net_names: set[str],
+    diff_pair_map: dict[str, str | None],
+) -> float:
+    for name in active_net_names:
+        partner = diff_pair_map.get(name)
+        if partner and partner in placed_net_names:
+            return 1.0
+    for name in placed_net_names:
+        partner = diff_pair_map.get(name)
+        if partner and partner in active_net_names:
+            return 1.0
+    return 0.0

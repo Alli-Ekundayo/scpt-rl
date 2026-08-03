@@ -1,0 +1,57 @@
+# SCPT-RL smoke-test / CI configuration
+#
+# Tiny models and short rollouts that run in seconds on CPU.
+# Use this config for the CI test-python job and local development smoke tests.
+#
+# Usage:
+#   python scripts/train.py --config configs/smoke.yaml --no-wandb
+
+wandb_project: scpt-rl-smoke
+wandb_run_name: smoke
+
+env:
+  board_paths:
+    - dataset/base_raw/bistable_oscillator_with_555_timer_and_ldo_2lyr_setup_00.kicad_pcb
+    - dataset/base_raw/PModBoard.kicad_pcb
+  grid_resolution_mm: 1.0
+  min_spacing_mm: 0.2
+  expert_cut_cost: 1.0
+  infeasible_penalty: 100.0
+
+model:
+  d: 32                       # tiny hidden dim for fast CPU tests
+  pair_dim: 4                 # minimal pair feature dim
+  n_heads: 2
+  n_layers: 1
+
+bc:
+  board_paths:
+    - dataset/base_raw/bistable_oscillator_with_555_timer_and_ldo_2lyr_setup_00.kicad_pcb
+    - dataset/base_raw/PModBoard.kicad_pcb
+  epochs: 2
+  lr: 1.0e-3
+
+ppo:
+  n_outer_iters: 5
+  n_steps_per_iter: 16
+
+  clip_eps: 0.2
+  gamma: 0.99
+  gae_lambda: 0.95
+  lr: 1.0e-3
+  epochs: 1
+  minibatch_size: 8
+
+  sigma: 1.0
+
+  constraint_names:
+    - c_hpwl
+
+  constraint_budgets:
+    c_hpwl: 999.0             # very loose budget for smoke tests
+
+  dual_alpha: 0.01
+  dual_ema_decay: 0.9
+
+  checkpoint_interval: 5
+  log_interval: 1

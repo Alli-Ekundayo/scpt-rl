@@ -167,6 +167,20 @@ class PcbPlacementEnv(gym.Env):
         terminated = st.placed_count == len(st.placement_order)
         return self._build_obs(), reward, terminated, False, {"costs": costs}
 
+    def current_design(self) -> dict:
+        assert self.state is not None, "env not reset"
+        return self.state.design
+
+    def current_active_index(self) -> int | None:
+        assert self.state is not None, "env not reset"
+        if self.state.step_idx >= len(self.state.placement_order):
+            return None
+        return self.state.placement_order[self.state.step_idx]
+
+    def current_placed_indices(self) -> list[int]:
+        assert self.state is not None, "env not reset"
+        return list(self.state.placement_order[: self.state.step_idx])
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------

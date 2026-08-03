@@ -1,0 +1,175 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "dev"]
+  pull_request:
+    branches: ["main", "dev"]
+
+# Cancel in-progress runs on the same branch to save minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Python unit tests (no Rust wheel required — mocked via conftest stubs)
+  # ---------------------------------------------------------------------------
+  test-python:
+    name: Python tests (3.11)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install project (CPU-only torch)
+        run: |
+          # Install PyTorch CPU-only first to avoid large GPU wheel download in CI.
+          uv pip install --system torch --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --system ".[dev]" 2>/dev/null || uv pip install --system -e .
+          # Install test extras that don't require the Rust wheel.
+          uv pip install --system pytest pytest-cov pyyaml gymnasium numpy matplotlib
+
+      - name: Run Python tests (skipping Rust-wheel-gated tests)
+        run: |
+          python -m pytest tests/ \
+            --ignore=tests/test_pcb_env.py \
+            --ignore=tests/test_rust_bridge.py \
+            --ignore=tests/test_router_smoke.py \
+            --ignore=tests/test_parser_roundtrip.py \
+            -v --tb=short \
+            --cov=src/scpt --cov-report=term-missing --cov-report=xml \
+            -x
+
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v4
+        with:
+          file: coverage.xml
+          fail_ci_if_error: false
+
+  # ---------------------------------------------------------------------------
+  # Rust compilation + Rust tests
+  # ---------------------------------------------------------------------------
+  test-rust:
+    name: Rust build & tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Rust crates
+        run: cargo build --workspace
+
+      - name: Run Rust tests
+        run: cargo test --workspace
+
+  # ---------------------------------------------------------------------------
+  # Integration smoke test: build Rust wheel + run full test suite
+  # (Only runs on push to main, not on every PR to save CI minutes)
+  # ---------------------------------------------------------------------------
+  integration:
+    name: Integration (Rust wheel + full test suite)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+    needs: [test-python, test-rust]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install uv + maturin
+        run: pip install uv maturin
+
+      - name: Build and install Rust wheel (pcb_parser)
+        run: bash scripts/build_rust.sh
+
+      - name: Install Python dependencies
+        run: |
+          uv pip install --system torch --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --system -e .
+          uv pip install --system pytest pytest-cov pyyaml gymnasium numpy matplotlib
+
+      - name: Run full test suite
+        run: |
+          python -m pytest tests/ -v --tb=short -x
+
+  # ---------------------------------------------------------------------------
+  # Linting + formatting checks
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint & format (ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Ruff check
+        run: ruff check src/ scripts/ tests/ --output-format=github
+
+      - name: Ruff format check
+        run: ruff format --check src/ scripts/ tests/
+
+  # ---------------------------------------------------------------------------
+  # Type-check with pyright (non-blocking: continues on error)
+  # ---------------------------------------------------------------------------
+  typecheck:
+    name: Type check (pyright)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv + pyright
+        run: pip install uv pyright
+
+      - name: Install project (stubs only)
+        run: |
+          uv pip install --system torch --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --system -e .
+          uv pip install --system pyyaml gymnasium numpy matplotlib
+
+      - name: Run pyright
+        run: pyright src/scpt/
