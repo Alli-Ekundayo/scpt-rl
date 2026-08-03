@@ -477,21 +477,19 @@ class PPOEALTrainer:
             return {k: v.cpu() if torch.is_tensor(v) else v for k, v in prepared.items()}
     
     def _to_tensor_obs(self, obs: dict) -> dict:
+        """Convert observation to tensors on CPU for storage in buffer."""
         prepared = dict(obs)
         for key, value in obs.items():
             if torch.is_tensor(value):
-                continue
-            if isinstance(value, np.ndarray):
+                # Ensure tensor is on CPU for storage
+                prepared[key] = value.cpu()
+            elif isinstance(value, np.ndarray):
                 tensor = torch.from_numpy(value)
                 if tensor.dtype in (torch.float64, torch.float16):
                     tensor = tensor.to(torch.float32)
-                if key in {"action_mask", "grid_xy", "z_star", "Z_placed", "F_pair", "z_comp_all"}:
-                    tensor = tensor.to(device=self.device, dtype=torch.float32)
-                elif key == "placed_comp_indices":
-                    tensor = tensor.to(device=self.device, dtype=torch.long)
                 prepared[key] = tensor
             elif isinstance(value, (float, int, bool)):
-                prepared[key] = torch.tensor(value, device=self.device)
+                prepared[key] = torch.tensor(value)
         return prepared
 
     # ------------------------------------------------------------------
