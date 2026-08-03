@@ -341,11 +341,14 @@ class PPOEALTrainer:
 
         # If we have precomputed tensors (old format), use them directly
         if z_star is not None and torch.is_tensor(z_star) and Z_placed is not None and torch.is_tensor(Z_placed):
-            pass  # Use the precomputed values
+            # Move to device if needed
+            z_star = z_star.to(device=self.device)
+            Z_placed = Z_placed.to(device=self.device)
         # If we have reconstruction data (new format), compute tensors on demand
         elif design_json is not None and active_idx is not None and placed_indices is not None:
             design = json.loads(design_json)
             _, z_star, Z_placed = encode_design(design, self.encoder, active_idx, placed_indices)
+            # encode_design returns tensors on the encoder's device, which should be self.device
         else:
             # Fallback to defaults
             z_star = torch.zeros(self.cfg.d, dtype=torch.float32, device=self.device)
@@ -358,6 +361,12 @@ class PPOEALTrainer:
             F_pair = torch.zeros(0, self.cfg.pair_dim, dtype=torch.float32, device=self.device)
         grid_xy = obs["grid_xy"]
         action_mask = obs["action_mask"]
+
+        # Move grid_xy and action_mask to device if they are CPU tensors
+        if torch.is_tensor(grid_xy) and grid_xy.device != self.device:
+            grid_xy = grid_xy.to(device=self.device)
+        if torch.is_tensor(action_mask) and action_mask.device != self.device:
+            action_mask = action_mask.to(device=self.device)
 
         logits = self.policy(z_star, Z_placed, F_pair, grid_xy, action_mask)
         dist = torch.distributions.Categorical(logits=logits)
@@ -377,12 +386,15 @@ class PPOEALTrainer:
 
         # If we have precomputed tensors (old format), use them directly
         if z_comp_all is not None and torch.is_tensor(z_comp_all) and z_comp_all.shape[0] > 0:
+            # Move to device if needed
+            z_comp_all = z_comp_all.to(device=self.device)
             return self.value_heads(z_comp_all)
 
         # If we have reconstruction data (new format), compute tensors on demand
         if design_json is not None and active_idx is not None and placed_indices is not None:
             design = json.loads(design_json)
             z_comp_all, _, Z_placed = encode_design(design, self.encoder, active_idx, placed_indices)
+            # encode_design returns tensors on the encoder's device, which should be self.device
             # If no components placed yet, use a dummy single-node embedding.
             if Z_placed.shape[0] == 0:
                 Z_placed = torch.zeros(1, self.cfg.d, device=self.device)
@@ -392,13 +404,18 @@ class PPOEALTrainer:
         Z_placed = obs.get("Z_placed", torch.zeros(0, self.cfg.d, device=self.device))
         if Z_placed.shape[0] == 0:
             Z_placed = torch.zeros(1, self.cfg.d, device=self.device)
+        else:
+            # Move to device if needed
+            Z_placed = Z_placed.to(device=self.device)
         return self.value_heads(Z_placed)
 
     def _prepare_obs(self, env, obs: dict) -> dict:
         """Convert env observations to tensors and attach encoder outputs when available."""
+        # Convert basic obs to tensors on device for immediate use
         prepared = self._to_tensor_obs(obs)
         if self.encoder is None:
-            return prepared
+            # No encoder available, store everything on CPU
+            return {k: v.cpu() if torch.is_tensor(v) else v for k, v in prepared.items()}
 
         design = None
         if hasattr(env, "current_design"):
@@ -406,53 +423,58 @@ class PPOEALTrainer:
         elif getattr(env, "state", None) is not None:
             design = env.state.design
 
-        if design is None:
-            return prepared
-
-        active_idx = None
-        placed_indices: list[int] = []
-        if hasattr(env, "current_active_index"):
-            active_idx = env.current_active_index()
-        elif getattr(env, "state", None) is not None and env.state.step_idx < len(env.state.placement_order):
-            active_idx = env.state.placement_order[env.state.step_idx]
-
-        if hasattr(env, "current_placed_indices"):
-            placed_indices = list(env.current_placed_indices())
-        elif getattr(env, "state", None) is not None:
-            placed_indices = list(env.state.placement_order[: env.state.step_idx])
-
-        if active_idx is None:
-            return prepared
-
-        with torch.no_grad():
-            z_comp_all, z_star, Z_placed = encode_design(design, self.encoder, active_idx, placed_indices)
-
-        F_pair = torch.zeros((len(placed_indices), self.cfg.pair_dim), dtype=torch.float32, device=self.device)
-        try:
-            from scpt.training.data import build_pair_features
-
-            pair_features = build_pair_features(design, active_idx, placed_indices)
-            if pair_features.shape[-1] == self.cfg.pair_dim:
-                F_pair = pair_features.to(device=self.device)
-            elif pair_features.numel() > 0:
-                F_pair = pair_features[:, : self.cfg.pair_dim].to(device=self.device)
-        except Exception:
-            pass
-
-        # Store minimal reconstruction data instead of full embeddings to prevent O(T^2) memory growth
-        # We'll store design_json and the indices needed to reconstruct embeddings during PPO update
-        # Also store F_pair on CPU to save GPU memory in the buffer (will be moved to GPU when used)
-        design_json = None
+        # If we have design data and encoder, use reconstruction format for storage
         if design is not None:
-            design_json = json.dumps(design)
+            active_idx = None
+            placed_indices: list[int] = []
+            if hasattr(env, "current_active_index"):
+                active_idx = env.current_active_index()
+            elif getattr(env, "state", None) is not None and env.state.step_idx < len(env.state.placement_order):
+                active_idx = env.state.placement_order[env.state.step_idx]
 
-        prepared.update({
-            "design_json": design_json,
-            "active_idx": active_idx,
-            "placed_indices": placed_indices,
-            "F_pair": F_pair.cpu(),  # Store on CPU to save GPU memory
-        })
-        return prepared
+            if hasattr(env, "current_placed_indices"):
+                placed_indices = list(env.current_placed_indices())
+            elif getattr(env, "state", None) is not None:
+                placed_indices = list(env.state.placement_order[: env.state.step_idx])
+
+            # If we couldn't get active_idx, fall back to storing tensors on CPU
+            if active_idx is None:
+                return {k: v.cpu() if torch.is_tensor(v) else v for k, v in prepared.items()}
+
+            with torch.no_grad():
+                # We compute these but don't store them - we'll reconstruct from design data
+                z_comp_all, z_star, Z_placed = encode_design(design, self.encoder, active_idx, placed_indices)
+
+            F_pair = torch.zeros((len(placed_indices), self.cfg.pair_dim), dtype=torch.float32, device=self.device)
+            try:
+                from scpt.training.data import build_pair_features
+
+                pair_features = build_pair_features(design, active_idx, placed_indices)
+                if pair_features.shape[-1] == self.cfg.pair_dim:
+                    F_pair = pair_features.to(device=self.device)
+                elif pair_features.numel() > 0:
+                    F_pair = pair_features[:, : self.cfg.pair_dim].to(device=self.device)
+            except Exception:
+                pass
+
+            design_json = None
+            if design is not None:
+                design_json = json.dumps(design)
+
+            # Store reconstruction format (compact)
+            return {
+                "design_json": design_json,
+                "active_idx": active_idx,
+                "placed_indices": placed_indices,
+                # Store these tensors on CPU for immediate use during rollout collection
+                "action_mask": prepared["action_mask"].cpu(),
+                "grid_xy": prepared["grid_xy"].cpu(),
+                "F_pair": F_pair.cpu(),
+                "placed_comp_indices": prepared["placed_comp_indices"].cpu(),
+            }
+        else:
+            # No design data available, fall back to storing tensors on CPU
+            return {k: v.cpu() if torch.is_tensor(v) else v for k, v in prepared.items()}
     
     def _to_tensor_obs(self, obs: dict) -> dict:
         prepared = dict(obs)
@@ -610,11 +632,14 @@ class PPOEALTrainer:
 
                     # If we have precomputed tensors (old format), use them directly
                     if z_star is not None and torch.is_tensor(z_star) and Z_placed is not None and torch.is_tensor(Z_placed):
-                        pass  # Use the precomputed values
+                        # Move to device if needed
+                        z_star = z_star.to(device=self.device)
+                        Z_placed = Z_placed.to(device=self.device)
                     # If we have reconstruction data (new format), compute tensors on demand
                     elif design_json is not None and active_idx is not None and placed_indices is not None:
                         design = json.loads(design_json)
                         _, z_star, Z_placed = encode_design(design, self.encoder, active_idx, placed_indices)
+                        # encode_design returns tensors on the encoder's device, which should be self.device
                     else:
                         # Fallback to defaults
                         z_star = torch.zeros(self.cfg.d, device=self.device)
@@ -628,6 +653,12 @@ class PPOEALTrainer:
                     grid_xy = obs_i["grid_xy"]
                     # Use stored mask — never recomputed.
                     mask = self.buffer.action_masks[i]
+
+                    # Move tensors to device if needed
+                    if torch.is_tensor(grid_xy) and grid_xy.device != self.device:
+                        grid_xy = grid_xy.to(device=self.device)
+                    if torch.is_tensor(mask) and mask.device != self.device:
+                        mask = mask.to(device=self.device)
                     logits = self.policy(z_star, Z_placed, F_pair, grid_xy, mask)
                     dist = torch.distributions.Categorical(logits=logits)
                     action_i = torch.tensor(self.buffer.actions[i], device=self.device)
