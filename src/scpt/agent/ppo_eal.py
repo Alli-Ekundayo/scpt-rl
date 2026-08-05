@@ -156,9 +156,9 @@ def compute_gae(
 
 
 def normalize_advantages(advantages: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """Per-batch advantage normalization (mean 0, std 1).
+    """Per-batch advantage normalization (center to mean 0, scale to std 1 if std >= eps).
 
-    Skipped when std < eps to avoid division-by-zero on degenerate batches.
+    Centered always, scaled only when std >= eps to avoid division-by-zero on degenerate batches.
     """
     if advantages.numel() < 2:
         return advantages
@@ -279,6 +279,8 @@ class PPOEALTrainer:
         )
 
         all_params = list(policy.parameters()) + list(value_heads.parameters())
+        if self.encoder is not None:
+            all_params += list(self.encoder.parameters())
         self.optimizer = optim.Adam(all_params, lr=cfg.lr)
 
     # ------------------------------------------------------------------
@@ -331,42 +333,7 @@ class PPOEALTrainer:
     @torch.no_grad()
     def _sample_action(self, obs: dict) -> tuple[int, torch.Tensor]:
         """Sample an action from the policy. Returns (action_int, log_prob)."""
-        # Handle both old format (precomputed tensors) and new format (reconstruction data)
-        z_star = obs.get("z_star")
-        Z_placed = obs.get("Z_placed")
-        design_json = obs.get("design_json")
-        active_idx = obs.get("active_idx")
-        placed_indices = obs.get("placed_indices")
-        F_pair = obs.get("F_pair")
-
-        # If we have precomputed tensors (old format), use them directly
-        if z_star is not None and torch.is_tensor(z_star) and Z_placed is not None and torch.is_tensor(Z_placed):
-            # Move to device if needed
-            z_star = z_star.to(device=self.device)
-            Z_placed = Z_placed.to(device=self.device)
-        # If we have reconstruction data (new format), compute tensors on demand
-        elif design_json is not None and active_idx is not None and placed_indices is not None:
-            design = json.loads(design_json)
-            _, z_star, Z_placed = encode_design(design, self.encoder, active_idx, placed_indices)
-            # encode_design returns tensors on the encoder's device, which should be self.device
-        else:
-            # Fallback to defaults
-            z_star = torch.zeros(self.cfg.d, dtype=torch.float32, device=self.device)
-            Z_placed = torch.zeros(0, self.cfg.d, dtype=torch.float32, device=self.device)
-
-        # Ensure F_pair is on the correct device (move from CPU if needed)
-        if F_pair is not None:
-            F_pair = F_pair.to(device=self.device)
-        else:
-            F_pair = torch.zeros(0, self.cfg.pair_dim, dtype=torch.float32, device=self.device)
-        grid_xy = obs["grid_xy"]
-        action_mask = obs["action_mask"]
-
-        # Move grid_xy and action_mask to device if they are CPU tensors
-        if torch.is_tensor(grid_xy) and grid_xy.device != self.device:
-            grid_xy = grid_xy.to(device=self.device)
-        if torch.is_tensor(action_mask) and action_mask.device != self.device:
-            action_mask = action_mask.to(device=self.device)
+        z_star, Z_placed, F_pair, grid_xy, action_mask = self._get_policy_inputs(obs)
 
         logits = self.policy(z_star, Z_placed, F_pair, grid_xy, action_mask)
         dist = torch.distributions.Categorical(logits=logits)
@@ -378,35 +345,12 @@ class PPOEALTrainer:
         self, obs: dict
     ) -> dict[str, torch.Tensor]:
         """Estimate V(s) for the reward and each constraint."""
-        # Handle both old format (precomputed tensors) and new format (reconstruction data)
-        z_comp_all = obs.get("z_comp_all")
-        design_json = obs.get("design_json")
-        active_idx = obs.get("active_idx")
-        placed_indices = obs.get("placed_indices")
+        z_star, Z_placed, F_pair, grid_xy, action_mask = self._get_policy_inputs(obs)
 
-        # If we have precomputed tensors (old format), use them directly
-        if z_comp_all is not None and torch.is_tensor(z_comp_all) and z_comp_all.shape[0] > 0:
-            # Move to device if needed
-            z_comp_all = z_comp_all.to(device=self.device)
-            return self.value_heads(z_comp_all)
-
-        # If we have reconstruction data (new format), compute tensors on demand
-        if design_json is not None and active_idx is not None and placed_indices is not None:
-            design = json.loads(design_json)
-            z_comp_all, _, Z_placed = encode_design(design, self.encoder, active_idx, placed_indices)
-            # encode_design returns tensors on the encoder's device, which should be self.device
-            # If no components placed yet, use a dummy single-node embedding.
-            if Z_placed.shape[0] == 0:
-                Z_placed = torch.zeros(1, self.cfg.d, device=self.device)
-            return self.value_heads(Z_placed)
-
-        # Fallback: minimal Z_placed
-        Z_placed = obs.get("Z_placed", torch.zeros(0, self.cfg.d, device=self.device))
+        # For value function, we only need Z_placed (placed component embeddings)
+        # If no components placed yet, use a dummy single-node embedding.
         if Z_placed.shape[0] == 0:
             Z_placed = torch.zeros(1, self.cfg.d, device=self.device)
-        else:
-            # Move to device if needed
-            Z_placed = Z_placed.to(device=self.device)
         return self.value_heads(Z_placed)
 
     def _prepare_obs(self, env, obs: dict) -> dict:
@@ -496,6 +440,53 @@ class PPOEALTrainer:
                 prepared[key] = torch.tensor(value)
         return prepared
 
+    def _get_policy_inputs(self, obs: dict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Extract and prepare policy inputs from observation.
+
+        Handles both legacy format (precomputed tensors) and reconstruction format.
+
+        Returns:
+            Tuple of (z_star, Z_placed, F_pair, grid_xy, action_mask) all on self.device
+        """
+        # Handle both old format (precomputed tensors) and new format (reconstruction data)
+        z_star = obs.get("z_star")
+        Z_placed = obs.get("Z_placed")
+        design_json = obs.get("design_json")
+        active_idx = obs.get("active_idx")
+        placed_indices = obs.get("placed_indices")
+        F_pair = obs.get("F_pair")
+
+        # If we have precomputed tensors (old format), use them directly
+        if z_star is not None and torch.is_tensor(z_star) and Z_placed is not None and torch.is_tensor(Z_placed):
+            # Move to device if needed
+            z_star = z_star.to(device=self.device)
+            Z_placed = Z_placed.to(device=self.device)
+        # If we have reconstruction data (new format), compute tensors on demand
+        elif design_json is not None and active_idx is not None and placed_indices is not None:
+            design = json.loads(design_json)
+            _, z_star, Z_placed = encode_design(design, self.encoder, active_idx, placed_indices)
+            # encode_design returns tensors on the encoder's device, which should be self.device
+        else:
+            # Fallback to defaults
+            z_star = torch.zeros(self.cfg.d, dtype=torch.float32, device=self.device)
+            Z_placed = torch.zeros(0, self.cfg.d, dtype=torch.float32, device=self.device)
+
+        # Ensure F_pair is on the correct device (move from CPU if needed)
+        if F_pair is not None:
+            F_pair = F_pair.to(device=self.device)
+        else:
+            F_pair = torch.zeros(0, self.cfg.pair_dim, dtype=torch.float32, device=self.device)
+        grid_xy = obs["grid_xy"]
+        action_mask = obs["action_mask"]
+
+        # Move grid_xy and action_mask to device if they are CPU tensors
+        if torch.is_tensor(grid_xy) and grid_xy.device != self.device:
+            grid_xy = grid_xy.to(device=self.device)
+        if torch.is_tensor(action_mask) and action_mask.device != self.device:
+            action_mask = action_mask.to(device=self.device)
+
+        return z_star, Z_placed, F_pair, grid_xy, action_mask
+
     # ------------------------------------------------------------------
     # GAE computation
     # ------------------------------------------------------------------
@@ -546,8 +537,10 @@ class PPOEALTrainer:
             if action < len(mask_cpu) and float(mask_cpu[action]) > 0.5:
                 legal_flags[t] = 1.0
 
+        assert torch.all(legal_flags == 1.0), "Buffer contains illegal actions"
+
         raw_gae = compute_gae(costs_t, values, dones, next_value.to(self.device), gamma, gae_lambda)
-        return raw_gae * legal_flags
+        return raw_gae
 
     # ------------------------------------------------------------------
     # PPO-EAL update
@@ -651,10 +644,9 @@ class PPOEALTrainer:
                     elif (design_json is not None and active_idx is not None
                             and placed_indices is not None):
                         design = json.loads(design_json)
-                        with torch.no_grad():          # GNN must not build graph here
-                            _, z_star, Z_placed = encode_design(
-                                design, self.encoder, active_idx, placed_indices
-                            )
+                        _, z_star, Z_placed = encode_design(
+                            design, self.encoder, active_idx, placed_indices
+                        )
                     else:
                         z_star = torch.zeros(self.cfg.d, device=self.device)
                         Z_placed = torch.zeros(0, self.cfg.d, device=self.device)
