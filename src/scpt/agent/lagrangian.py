@@ -30,6 +30,7 @@ class MomentumDualUpdater:
     constraint_names: list[str]
     alpha: float
     ema_decay: float
+    max_lambda: float = 100.0
     _lambdas: dict[str, float] = field(default_factory=dict)
     _ema: dict[str, float] = field(default_factory=dict)
 
@@ -53,7 +54,7 @@ class MomentumDualUpdater:
         for n in self.constraint_names:
             phi = phi_c_by_name.get(n, 0.0)
             self._ema[n] = self.ema_decay * self._ema[n] + (1.0 - self.ema_decay) * phi
-            self._lambdas[n] = max(0.0, self._lambdas[n] + self.alpha * self._ema[n])
+            self._lambdas[n] = max(0.0, min(self.max_lambda, self._lambdas[n] + self.alpha * self._ema[n]))
             out[n] = self._lambdas[n]
         return out
 

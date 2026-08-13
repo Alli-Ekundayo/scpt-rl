@@ -582,9 +582,11 @@ class PPOEALTrainer:
         # ------------------------------------------------------------------
         phi_c_estimates: dict[str, float] = {}
         j_c_pi_k: dict[str, float] = {}
+        constraint_advs_dict: dict[str, torch.Tensor] = {}
         for name in self.cfg.constraint_names:
             next_v = last_value_dict.get(name, torch.tensor(0.0, device=self.device))
             c_advs = self._compute_constraint_gae(name, next_v, gamma, lam)
+            constraint_advs_dict[name] = c_advs
             j_c = float(torch.tensor(
                 [s.get(name, 0.0) for s in self.buffer.costs],
                 device=self.device,
@@ -621,6 +623,7 @@ class PPOEALTrainer:
                 batch_size = idx.numel()
                 batch_policy_surr = 0.0
                 batch_value_loss = 0.0
+                batch_constraint_pen = 0.0
 
                 # ----------------------------------------------------------
                 # Gradient accumulation: one item at a time
@@ -678,10 +681,18 @@ class PPOEALTrainer:
                     ) * adv
                     surr_i = torch.minimum(unclipped, clipped)
 
+                    # Constraint penalty via linear Lagrangian:
+                    # sum_c lambda_c * ratio * A_c_i
+                    constraint_penalty_i = torch.zeros((), device=self.device)
+                    for cname in self.cfg.constraint_names:
+                        c_adv_i = constraint_advs_dict[cname][i]
+                        constraint_penalty_i = constraint_penalty_i + lambdas[cname] * ratio * c_adv_i
+
                     # Scale by batch size so the mean gradient is preserved
-                    policy_loss_i = -surr_i / batch_size
+                    policy_loss_i = (-surr_i + constraint_penalty_i) / batch_size
                     policy_loss_i.backward()
                     batch_policy_surr += surr_i.item()
+                    batch_constraint_pen += constraint_penalty_i.item()
 
                     # ---- value forward -----------------------------------
                     # Mirror _compute_value logic: Z_placed, dummy row if empty
@@ -693,21 +704,16 @@ class PPOEALTrainer:
                     v_loss_i.backward()
                     batch_value_loss += v_loss_i.item() * batch_size
 
-                # Constraint penalty is constant w.r.t. policy params;
-                # it only affects the dual update, not the gradient step.
-                phi_tensors = {
-                    name: torch.tensor(phi_c_estimates[name], device=self.device)
-                    for name in self.cfg.constraint_names
-                }
-                penalty = torch.stack([
-                    augmented_lagrangian_penalty(phi_tensors[k], lambdas[k], sigma)
-                    for k in phi_tensors
-                ]).sum() if phi_tensors else torch.tensor(0.0, device=self.device)
+                # Gradient clipping to prevent instability from large costs.
+                all_params = list(self.policy.parameters()) + list(self.value_heads.parameters())
+                if self.encoder is not None:
+                    all_params += list(self.encoder.parameters())
+                torch.nn.utils.clip_grad_norm_(all_params, max_norm=0.5)
 
                 self.optimizer.step()
 
                 with torch.no_grad():
-                    effective_loss = -batch_policy_surr / batch_size + penalty.item()
+                    effective_loss = (-batch_policy_surr + batch_constraint_pen) / batch_size
                     total_policy_loss += effective_loss
                     total_value_loss += batch_value_loss / batch_size
 

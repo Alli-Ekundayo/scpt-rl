@@ -14,6 +14,7 @@ profiling says so.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -159,10 +160,10 @@ class PcbPlacementEnv(gym.Env):
                     "costs": costs, "infeasible": True,
                 }
 
-        # Reward: Tier 2 minus constraint costs.
-        tier2 = costs.get("r_tier2", 0.0)
-        constraint_sum = sum(v for k, v in costs.items() if k.startswith("c_"))
-        reward = tier2 - constraint_sum
+        # Reward = negative HPWL (objective: minimise wirelength).
+        # Constraint costs (clearance, partition) are handled exclusively
+        # by the PPO-EAL Lagrangian — not subtracted from reward.
+        reward = -costs.get("c_hpwl", 0.0)
 
         terminated = st.placed_count == len(st.placement_order)
         return self._build_obs(), reward, terminated, False, {"costs": costs}
@@ -198,22 +199,47 @@ class PcbPlacementEnv(gym.Env):
         }
 
     def _compute_mask(self, active_ref_des: str) -> np.ndarray:
-        """Coarse overlap/off-board mask.
+        """Overlap + clearance mask over the placement grid.
 
-        v1: marks cells occupied by already-placed components as illegal.
-        The clearance / keepout filtering happens via the soft cost instead.
+        For each already-placed component, masks all grid cells covered by
+        its bounding box plus a `min_spacing_mm` clearance margin.  Falls
+        back to the clearance margin alone when component bounds are not
+        available in the design dict.
         """
         mask = np.ones(self.H * self.W, dtype=np.float32)
-        # Mark cells where another component is placed as illegal.
+        res = self.cfg.grid_resolution_mm
+        margin_cells = max(1, int(math.ceil(self.cfg.min_spacing_mm / res)))
+        board_bounds = self.state.design["board"]["bounds"]
+        active_order_idx = (
+            self.state.step_idx
+            if self.state.step_idx < len(self.state.placement_order)
+            else 0
+        )
+        active_comp_idx = self.state.placement_order[active_order_idx]
+
         for i, p in enumerate(self.state.design["placement"]["positions"]):
-            if p is None or i == self.state.placement_order[self.state.step_idx if self.state.step_idx < len(self.state.placement_order) else 0]:
+            if p is None or i == active_comp_idx:
                 continue
             pos = p["position"]
-            bounds = self.state.design["board"]["bounds"]
-            cx = int((pos[0] - bounds["x"]) / self.cfg.grid_resolution_mm)
-            cy = int((pos[1] - bounds["y"]) / self.cfg.grid_resolution_mm)
-            if 0 <= cx < self.W and 0 <= cy < self.H:
-                mask[cy * self.W + cx] = 0.0
+            cx = int((pos[0] - board_bounds["x"]) / res)
+            cy = int((pos[1] - board_bounds["y"]) / res)
+
+            # Determine half-extents in grid cells.
+            comp = self.state.design["components"][i]
+            comp_bounds = comp.get("bounds")
+            if comp_bounds and "w" in comp_bounds and "h" in comp_bounds:
+                half_w = max(1, int(math.ceil(comp_bounds["w"] / (2.0 * res)))) + margin_cells
+                half_h = max(1, int(math.ceil(comp_bounds["h"] / (2.0 * res)))) + margin_cells
+            else:
+                half_w = margin_cells
+                half_h = margin_cells
+
+            # Mask rectangular region around placed component.
+            for dy in range(-half_h, half_h + 1):
+                for dx in range(-half_w, half_w + 1):
+                    gx, gy = cx + dx, cy + dy
+                    if 0 <= gx < self.W and 0 <= gy < self.H:
+                        mask[gy * self.W + gx] = 0.0
         return mask
 
     def _build_obs(self) -> dict[str, np.ndarray]:

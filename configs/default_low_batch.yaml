@@ -69,12 +69,10 @@ ppo:
   sigma: 1.0
 
   constraint_names:
-    - c_hpwl
     - c_clearance
     - c_partition
 
   constraint_budgets:
-    c_hpwl: 500.0
     c_clearance: 0.0
     c_partition: 1.15
 
