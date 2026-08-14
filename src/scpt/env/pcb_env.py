@@ -160,10 +160,14 @@ class PcbPlacementEnv(gym.Env):
                     "costs": costs, "infeasible": True,
                 }
 
-        # Reward = negative HPWL (objective: minimise wirelength).
+        # Reward = negative HPWL normalised by board diagonal.
+        # Raw HPWL is in mm (O(500)–O(2000)); dividing by the board diagonal
+        # brings the reward to O(−10), commensurate with normalised advantages.
         # Constraint costs (clearance, partition) are handled exclusively
         # by the PPO-EAL Lagrangian — not subtracted from reward.
-        reward = -costs.get("c_hpwl", 0.0)
+        _bounds = st.design["board"]["bounds"]
+        board_diag = math.sqrt(_bounds["w"] ** 2 + _bounds["h"] ** 2)
+        reward = -costs.get("c_hpwl", 0.0) / max(board_diag, 1.0)
 
         terminated = st.placed_count == len(st.placement_order)
         return self._build_obs(), reward, terminated, False, {"costs": costs}
@@ -187,9 +191,27 @@ class PcbPlacementEnv(gym.Env):
     # ------------------------------------------------------------------
 
     def _compute_costs(self, moved_ref_des: str) -> dict[str, float]:
-        """Call pcb_parser primitives for the current design state."""
+        """Call pcb_parser primitives for the current design state.
+
+        Normalisation
+        -------------
+        * ``c_clearance``: raw output of ``clearance_cost`` is a sum of
+          pairwise bounding-box overlap *areas* in mm², which grows as
+          O(P²·component_area) and easily reaches millions when components
+          are stacked.  Dividing by board area gives a dimensionless value
+          in [0, ∞) that is O(1) for a heavily overlapping layout and 0
+          for a clean one — commensurate with the reward signal.
+        * ``c_hpwl``: raw HPWL is in mm (O(500)–O(2000)).  Normalisation
+          happens in ``step()`` where it enters the reward.
+        """
+        bounds = self.state.design["board"]["bounds"]
+        board_area = bounds["w"] * bounds["h"]
+        raw_clearance = pcb_parser.clearance_cost(
+            self.state.design_json, self.cfg.min_spacing_mm
+        )
         return {
-            "c_clearance": pcb_parser.clearance_cost(self.state.design_json, self.cfg.min_spacing_mm),
+            # Dimensionless: overlap_area_mm2 / board_area_mm2.
+            "c_clearance": raw_clearance / max(board_area, 1.0),
             "c_hpwl": pcb_parser.hpwl_incremental(self.state.design_json, moved_ref_des),
             # v1: partition cut not exposed yet — use 0.
             "c_partition": 0.0,
