@@ -583,10 +583,18 @@ class PPOEALTrainer:
         phi_c_estimates: dict[str, float] = {}
         j_c_pi_k: dict[str, float] = {}
         constraint_advs_dict: dict[str, torch.Tensor] = {}
+        constraint_returns: dict[str, torch.Tensor] = {}
         for name in self.cfg.constraint_names:
             next_v = last_value_dict.get(name, torch.tensor(0.0, device=self.device))
             c_advs = self._compute_constraint_gae(name, next_v, gamma, lam)
             constraint_advs_dict[name] = c_advs
+            # Constraint critic targets: raw GAE advantages + stored V_c(s_t).
+            c_values = torch.tensor(
+                [v.get(name, torch.tensor(0.0)).item() for v in self.buffer.values],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            constraint_returns[name] = c_advs + c_values
             j_c = float(torch.tensor(
                 [s.get(name, 0.0) for s in self.buffer.costs],
                 device=self.device,
@@ -694,15 +702,30 @@ class PPOEALTrainer:
                     batch_policy_surr += surr_i.item()
                     batch_constraint_pen += constraint_penalty_i.item()
 
-                    # ---- value forward -----------------------------------
-                    # Mirror _compute_value logic: Z_placed, dummy row if empty
+                    # ---- value forward: reward critic + constraint critics ----
+                    # Mirror _compute_value logic: Z_placed, dummy row if empty.
+                    # IMPORTANT: both reward AND constraint critics must be trained
+                    # here.  Untrained constraint critics produce random V_c(s),
+                    # which corrupts GAE deltas and inflates phi_c by ~100x via
+                    # the 1/(1-gamma) amplification in constraint_surrogate().
                     Z_v = Z_placed
                     if Z_v.shape[0] == 0:
                         Z_v = torch.zeros(1, self.cfg.d, device=self.device)
-                    v_pred = self.value_heads(Z_v)["reward"]
-                    v_loss_i = 0.5 * (v_pred - reward_returns[i]).pow(2) / batch_size
+                    v_preds = self.value_heads(Z_v)
+
+                    # Reward critic loss.
+                    v_loss_i = 0.5 * (v_preds["reward"] - reward_returns[i]).pow(2) / batch_size
                     v_loss_i.backward()
                     batch_value_loss += v_loss_i.item() * batch_size
+
+                    # Constraint critic losses (one per constraint).
+                    for cname in self.cfg.constraint_names:
+                        v_pred_c = v_preds[cname]
+                        v_loss_c_i = (
+                            0.5 * (v_pred_c - constraint_returns[cname][i]).pow(2) / batch_size
+                        )
+                        v_loss_c_i.backward()
+                        batch_value_loss += v_loss_c_i.item() * batch_size
 
                 # Gradient clipping to prevent instability from large costs.
                 all_params = list(self.policy.parameters()) + list(self.value_heads.parameters())
@@ -725,6 +748,11 @@ class PPOEALTrainer:
         return {
             "reward_mean": float(torch.tensor(self.buffer.rewards, device=self.device).mean()),
             "phi_c": phi_c_estimates,
+            "j_c": j_c_pi_k,           # raw per-step cost mean (should be small)
+            "c_adv_mean": {             # GAE advantage mean per constraint
+                name: float(constraint_advs_dict[name].mean())
+                for name in self.cfg.constraint_names
+            },
             "policy_loss": total_policy_loss,
             "value_loss": total_value_loss,
             "lambdas": self.dual_updater.lambdas,
