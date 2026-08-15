@@ -142,14 +142,16 @@ def _prepare_obs(env, obs: dict, encoder, d: int, pair_dim: int) -> dict:
     if pair_features.shape[-1] != pair_dim:
         F_pair = torch.zeros(len(placed_indices), pair_dim, device=device)
         if pair_features.numel() > 0:
-            F_pair[:, : min(pair_dim, pair_features.shape[-1])] = pair_features[:, : min(pair_dim, pair_features.shape[-1])]
+            cols = min(pair_dim, pair_features.shape[-1])
+            F_pair[:, :cols] = pair_features[:, :cols].to(device)
     else:
-        F_pair = pair_features
+        F_pair = pair_features.to(device)
 
-    prepared["z_star"] = z_star
-    prepared["Z_placed"] = Z_placed
+    prepared["z_star"] = z_star.to(device)
+    prepared["Z_placed"] = Z_placed.to(device)
     prepared["F_pair"] = F_pair
     return prepared
+
 
 
 @torch.no_grad()
