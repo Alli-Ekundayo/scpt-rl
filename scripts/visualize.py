@@ -4,9 +4,10 @@ Plots produced:
   1. reward_curve     — Episode reward vs outer iteration
   2. lambda_curve     — Lagrangian multipliers (λ) over training
   3. phi_c_curve      — Constraint violations (φ_c) over training
-  4. policy_loss      — Total PPO-EAL loss over training
-  5. bc_loss_curve    — BC pretraining loss per epoch (if BC log provided)
-  6. placement_heatmap— Heatmap of where the policy places components on a
+  4. j_c_breakdown    — j_c (raw cost) vs c_adv_mean (critic estimate) per constraint
+  5. policy_loss      — Total PPO-EAL loss over training
+  6. bc_loss_curve    — BC pretraining loss per epoch (if BC log provided)
+  7. placement_heatmap— Heatmap of where the policy places components on a
                          fixed grid (requires running a rollout)
 
 Usage::
@@ -201,6 +202,62 @@ def plot_phi_c_curve(records: list[dict], out_dir: Path) -> Path | None:
     return out
 
 
+def plot_j_c_breakdown(records: list[dict], out_dir: Path) -> Path | None:
+    """Plot j_c (raw per-step cost mean) and c_adv_mean (GAE advantage mean)
+    separately per constraint.
+
+    phi_c = j_c + (1/(1-gamma)) * c_adv_mean - budget.
+    Plotting these two components side-by-side immediately shows whether
+    phi_c is driven by real constraint violations (large j_c) or by a
+    noisy / unconverged constraint critic (large c_adv_mean with small j_c).
+    """
+    _apply_style()
+    constraint_keys = sorted({
+        k.replace("ppo/j_c/", "")
+        for rec in records
+        for k in rec
+        if k.startswith("ppo/j_c/")
+    })
+    if not constraint_keys:
+        logger.warning("No ppo/j_c/* keys found — skipping j_c breakdown plot"
+                       " (requires train.py from commit a1b608f+)")
+        return None
+
+    n = len(constraint_keys)
+    fig, axes = plt.subplots(n, 2, figsize=(13, 3.5 * n), squeeze=False)
+
+    for row, name in enumerate(constraint_keys):
+        # Left: j_c
+        ax_l = axes[row][0]
+        iters_j, vals_j = _extract_series(records, f"ppo/j_c/{name}")
+        ax_l.plot(iters_j, vals_j, color=_PALETTE[0], label=f"j_c({name})")
+        ax_l.axhline(0.0, color="#f78166", linestyle="--", linewidth=1.0, alpha=0.7)
+        ax_l.set_xlabel("Outer Iteration")
+        ax_l.set_ylabel("Raw cost mean (per step)")
+        ax_l.set_title(f"{name} — j_c (raw constraint cost)")
+        ax_l.legend()
+        ax_l.grid(True, alpha=0.4)
+
+        # Right: c_adv_mean
+        ax_r = axes[row][1]
+        iters_a, vals_a = _extract_series(records, f"ppo/c_adv_mean/{name}")
+        ax_r.plot(iters_a, vals_a, color=_PALETTE[2], label=f"c_adv_mean({name})")
+        ax_r.axhline(0.0, color="#f78166", linestyle="--", linewidth=1.0, alpha=0.7)
+        ax_r.set_xlabel("Outer Iteration")
+        ax_r.set_ylabel("GAE advantage mean")
+        ax_r.set_title(f"{name} — c_adv_mean (critic estimate; should→0 as critic converges)")
+        ax_r.legend()
+        ax_r.grid(True, alpha=0.4)
+
+    fig.suptitle("SCPT-RL — phi_c Decomposition: j_c vs c_adv_mean", y=1.01)
+    fig.tight_layout()
+    out = out_dir / "j_c_breakdown.png"
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved %s", out)
+    return out
+
+
 def plot_policy_loss(records: list[dict], out_dir: Path) -> Path | None:
     """Plot total PPO-EAL loss over training."""
     _apply_style()
@@ -359,6 +416,7 @@ def main(argv: list[str] | None = None) -> None:
         plot_reward_curve(records, out_dir)
         plot_lambda_curve(records, out_dir)
         plot_phi_c_curve(records, out_dir)
+        plot_j_c_breakdown(records, out_dir)
         plot_policy_loss(records, out_dir)
         plot_bc_loss_curve(records, out_dir)
     elif not args.heatmap:

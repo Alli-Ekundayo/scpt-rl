@@ -295,6 +295,12 @@ def run_ppo_phase(
                 record[f"ppo/phi_c/{k}"] = v
             for k, v in lambdas.items():
                 record[f"ppo/lambda/{k}"] = v
+            # Raw cost mean and GAE advantage mean — key for distinguishing
+            # "j_c is itself large" vs "critic is producing noisy advantages".
+            for k, v in diag.get("j_c", {}).items():
+                record[f"ppo/j_c/{k}"] = v
+            for k, v in diag.get("c_adv_mean", {}).items():
+                record[f"ppo/c_adv_mean/{k}"] = v
             _append_jsonl(log_path, record)
 
         if use_wandb:
@@ -343,6 +349,10 @@ def _wandb_log_iter(outer_iter: int, diag: dict) -> None:
             log[f"ppo/phi_c/{k}"] = v
         for k, v in diag.get("lambdas", {}).items():
             log[f"ppo/lambda/{k}"] = v
+        for k, v in diag.get("j_c", {}).items():
+            log[f"ppo/j_c/{k}"] = v
+        for k, v in diag.get("c_adv_mean", {}).items():
+            log[f"ppo/c_adv_mean/{k}"] = v
         wandb.log(log, step=outer_iter + 1)
     except Exception:
         pass

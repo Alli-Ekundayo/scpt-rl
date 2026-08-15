@@ -248,13 +248,27 @@ class PcbPlacementEnv(gym.Env):
 
             # Determine half-extents in grid cells.
             comp = self.state.design["components"][i]
-            comp_bounds = comp.get("bounds")
-            if comp_bounds and "w" in comp_bounds and "h" in comp_bounds:
-                half_w = max(1, int(math.ceil(comp_bounds["w"] / (2.0 * res)))) + margin_cells
-                half_h = max(1, int(math.ceil(comp_bounds["h"] / (2.0 * res)))) + margin_cells
+            # Derive half-extents from courtyard polygon AABB.
+            # NOTE: comp.get("bounds") is always None — the IR does not
+            # serialise a top-level bounds field.  The footprint geometry
+            # lives in comp["footprint"]["courtyard"]["points"] as a list
+            # of [x, y] pairs relative to the component's local origin.
+            courtyard_pts = (
+                comp.get("footprint", {}).get("courtyard", {}).get("points", [])
+            )
+            if courtyard_pts:
+                xs = [p[0] for p in courtyard_pts]
+                ys = [p[1] for p in courtyard_pts]
+                cyd_w = max(xs) - min(xs)
+                cyd_h = max(ys) - min(ys)
+                half_w = max(1, int(math.ceil(cyd_w / (2.0 * res)))) + margin_cells
+                half_h = max(1, int(math.ceil(cyd_h / (2.0 * res)))) + margin_cells
             else:
-                half_w = margin_cells
-                half_h = margin_cells
+                # Genuine fallback: courtyard absent in this component.
+                # Use a conservative 2-cell radius so at least adjacent
+                # cells are blocked even without footprint geometry.
+                half_w = 2 + margin_cells
+                half_h = 2 + margin_cells
 
             # Mask rectangular region around placed component.
             for dy in range(-half_h, half_h + 1):
