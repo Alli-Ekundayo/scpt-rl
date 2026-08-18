@@ -257,8 +257,11 @@ class PcbPlacementEnv(gym.Env):
                 comp.get("footprint", {}).get("courtyard", {}).get("points", [])
             )
             if courtyard_pts:
-                xs = [p[0] for p in courtyard_pts]
-                ys = [p[1] for p in courtyard_pts]
+                # Points are in local component coordinates (relative to
+                # component origin), so AABB width = max_x - min_x gives
+                # the actual courtyard extent regardless of placed position.
+                xs = [pt[0] for pt in courtyard_pts]
+                ys = [pt[1] for pt in courtyard_pts]
                 cyd_w = max(xs) - min(xs)
                 cyd_h = max(ys) - min(ys)
                 half_w = max(1, int(math.ceil(cyd_w / (2.0 * res)))) + margin_cells
