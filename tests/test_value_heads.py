@@ -23,9 +23,9 @@ def test_value_heads_separate_params():
     vh = ValueHeads(d=64, constraint_names=["c_hpwl"])
     assert vh.reward_critic is not vh.constraint_critics["c_hpwl"]
     # Weights should not be tied (random init → different).
-    assert not torch.allclose(
-        vh.reward_critic.weight, vh.constraint_critics["c_hpwl"].weight
-    )
+    reward_w = next(vh.reward_critic.parameters())
+    c_w = next(vh.constraint_critics["c_hpwl"].parameters())
+    assert not torch.allclose(reward_w, c_w)
 
 
 def test_value_heads_with_empty_graph_raises():

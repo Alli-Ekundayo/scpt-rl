@@ -27,9 +27,18 @@ class ValueHeads(nn.Module):
     def __init__(self, d: int, constraint_names: list[str]):
         super().__init__()
         self.constraint_names = list(constraint_names)
-        self.reward_critic = nn.Linear(d, 1)
+        self.reward_critic = nn.Sequential(
+            nn.Linear(d, d),
+            nn.ReLU(),
+            nn.Linear(d, 1),
+        )
         self.constraint_critics = nn.ModuleDict({
-            name: nn.Linear(d, 1) for name in constraint_names
+            name: nn.Sequential(
+                nn.Linear(d, d),
+                nn.ReLU(),
+                nn.Linear(d, 1),
+            )
+            for name in constraint_names
         })
 
     def forward(self, z_comp: torch.Tensor) -> dict[str, torch.Tensor]:
