@@ -168,6 +168,13 @@ def normalize_advantages(advantages: torch.Tensor, eps: float = 1e-8) -> torch.T
     return (advantages - advantages.mean()) / (std + eps)
 
 
+def _to_scalar(val: Any) -> float:
+    """Safely extract float scalar from tensor, numpy array, or primitive."""
+    if hasattr(val, "item"):
+        return float(val.item())
+    return float(val) if val is not None else 0.0
+
+
 # ---------------------------------------------------------------------------
 # Rollout buffer
 # ---------------------------------------------------------------------------
@@ -176,9 +183,9 @@ def normalize_advantages(advantages: torch.Tensor, eps: float = 1e-8) -> torch.T
 class RolloutBuffer:
     """Stores one episode's worth of transitions for PPO update.
 
-    Action masks are stored at collection time and never recomputed during
-    the loss pass — this prevents the mask-staleness bug where the policy
-    distribution shifts during the update and illegal actions become legal.
+    Action masks and grid coordinates are stored at collection time and never
+    recomputed during the loss pass — this prevents the mask-staleness bug where
+    the policy distribution shifts during the update and illegal actions become legal.
     """
     constraint_names: list[str]
     # Per-step fields (stored in collection order).
@@ -189,8 +196,9 @@ class RolloutBuffer:
     values: list[dict[str, torch.Tensor]] = field(default_factory=list)
     costs: list[dict[str, float]] = field(default_factory=list)
     dones: list[bool] = field(default_factory=list)
-    # Critically: masks stored at the moment of collection, not recomputed.
+    # Critically: masks and grid coordinates stored at the moment of collection.
     action_masks: list[torch.Tensor] = field(default_factory=list)
+    grid_xys: list[torch.Tensor] = field(default_factory=list)
 
     def add(
         self,
@@ -209,8 +217,9 @@ class RolloutBuffer:
         self.values.append({k: v.detach() for k, v in value.items()})
         self.costs.append(costs)
         self.dones.append(done)
-        # Store the mask from obs — this is the ONLY place masks are captured.
-        self.action_masks.append(obs["action_mask"].detach().clone())
+        # Store mask and grid_xy from obs — captured consistently.
+        self.action_masks.append(torch.as_tensor(obs["action_mask"]).detach().clone())
+        self.grid_xys.append(torch.as_tensor(obs["grid_xy"]).detach().clone())
 
     def clear(self) -> None:
         self.obs_list.clear()
@@ -221,6 +230,7 @@ class RolloutBuffer:
         self.costs.clear()
         self.dones.clear()
         self.action_masks.clear()
+        self.grid_xys.clear()
 
     def __len__(self) -> int:
         return len(self.rewards)
@@ -364,11 +374,8 @@ class PPOEALTrainer:
     ) -> dict[str, torch.Tensor]:
         """Estimate V(s) for the reward and each constraint."""
         z_star, Z_placed, F_pair, grid_xy, action_mask = self._get_policy_inputs(obs)
-
-        # For value function, we only need Z_placed (placed component embeddings)
-        # If no components placed yet, use a dummy single-node embedding.
         if Z_placed.shape[0] == 0:
-            Z_placed = torch.zeros(1, self.cfg.d, device=self.device)
+            Z_placed = torch.zeros(0, self.cfg.d, device=self.device)
         return self.value_heads(Z_placed)
 
     def _prepare_obs(self, env, obs: dict) -> dict:
@@ -419,15 +426,11 @@ class PPOEALTrainer:
             except Exception:
                 pass
 
-            design_json = None
-            if design is not None:
-                design_json = json.dumps(design)
-
             # Store reconstruction format (compact)
             z_star_cpu = z_star.cpu()
             Z_placed_cpu = Z_placed.cpu()
             return {
-                "design_json": design_json,
+                "design": design,
                 "active_idx": active_idx,
                 "placed_indices": placed_indices,
                 # Store these tensors on CPU for immediate use during rollout collection
@@ -469,6 +472,7 @@ class PPOEALTrainer:
         # Handle both old format (precomputed tensors) and new format (reconstruction data)
         z_star = obs.get("z_star")
         Z_placed = obs.get("Z_placed")
+        design = obs.get("design")
         design_json = obs.get("design_json")
         active_idx = obs.get("active_idx")
         placed_indices = obs.get("placed_indices")
@@ -480,8 +484,9 @@ class PPOEALTrainer:
             z_star = z_star.to(device=self.device)
             Z_placed = Z_placed.to(device=self.device)
         # If we have reconstruction data (new format), compute tensors on demand
-        elif design_json is not None and active_idx is not None and placed_indices is not None:
-            design = json.loads(design_json)
+        elif (design is not None or design_json is not None) and active_idx is not None and placed_indices is not None:
+            if design is None and design_json is not None:
+                design = json.loads(design_json)
             _, z_star, Z_placed = encode_design(design, self.encoder, active_idx, placed_indices)
             # encode_design returns tensors on the encoder's device, which should be self.device
         else:
@@ -517,9 +522,13 @@ class PPOEALTrainer:
     ) -> torch.Tensor:
         """Compute GAE for the reward signal."""
         T = len(self.buffer)
-        rewards = torch.tensor(self.buffer.rewards, dtype=torch.float32, device=self.device)
+        rewards = torch.tensor(
+            [float(r) for r in self.buffer.rewards], dtype=torch.float32, device=self.device
+        )
         values = torch.tensor(
-            [v["reward"].item() for v in self.buffer.values], dtype=torch.float32, device=self.device
+            [_to_scalar(v.get("reward", 0.0)) for v in self.buffer.values],
+            dtype=torch.float32,
+            device=self.device,
         )
         dones = torch.tensor(
             [float(d) for d in self.buffer.dones], dtype=torch.float32, device=self.device
@@ -533,32 +542,32 @@ class PPOEALTrainer:
         gamma: float,
         gae_lambda: float,
     ) -> torch.Tensor:
+        """Compute GAE for a single constraint signal, masked by legal actions."""
         T = len(self.buffer)
         costs_t = torch.tensor(
-            [step.get(constraint_name, 0.0) for step in self.buffer.costs],
+            [_to_scalar(step.get(constraint_name, 0.0)) for step in self.buffer.costs],
             dtype=torch.float32,
             device=self.device,
         )
         values = torch.tensor(
-            [v.get(constraint_name, torch.tensor(0.0)).item() for v in self.buffer.values],
+            [_to_scalar(v.get(constraint_name, 0.0)) for v in self.buffer.values],
             dtype=torch.float32,
-            device=self.device,          # <-- was missing
+            device=self.device,
         )
         dones = torch.tensor(
             [float(d) for d in self.buffer.dones],
             dtype=torch.float32,
-            device=self.device,          # <-- was missing
+            device=self.device,
         )
         legal_flags = torch.zeros(T, device=self.device)
         for t, (action, mask) in enumerate(zip(self.buffer.actions, self.buffer.action_masks)):
             mask_cpu = mask.detach().cpu()
-            if action < len(mask_cpu) and float(mask_cpu[action]) > 0.5:
+            if 0 <= action < len(mask_cpu) and float(mask_cpu[action]) > 0.5:
                 legal_flags[t] = 1.0
 
-        assert torch.all(legal_flags == 1.0), "Buffer contains illegal actions"
-
         raw_gae = compute_gae(costs_t, values, dones, next_value.to(self.device), gamma, gae_lambda)
-        return raw_gae
+        # Weight by legal_flags so illegal actions do not bias constraint advantage expectations
+        return raw_gae * legal_flags
 
     # ------------------------------------------------------------------
     # PPO-EAL update
@@ -568,6 +577,18 @@ class PPOEALTrainer:
         """Run PPO-EAL update on the current buffer. Returns diagnostics dict."""
         if len(self.buffer) == 0:
             return {"reward_mean": 0.0, "phi_c": {k: 0.0 for k in self.cfg.constraint_names}}
+
+        T = len(self.buffer)
+
+        # ------------------------------------------------------------------
+        # Compute legal flags across rollout
+        # ------------------------------------------------------------------
+        legal_flags = torch.zeros(T, device=self.device)
+        for t, (action, mask) in enumerate(zip(self.buffer.actions, self.buffer.action_masks)):
+            mask_cpu = mask.detach().cpu()
+            if 0 <= action < len(mask_cpu) and float(mask_cpu[action]) > 0.5:
+                legal_flags[t] = 1.0
+        legal_count = legal_flags.sum().clamp(min=1.0)
 
         # ------------------------------------------------------------------
         # Bootstrap value at end of rollout.
@@ -588,7 +609,7 @@ class PPOEALTrainer:
             gae_lambda=lam,
         )
         reward_values = torch.tensor(
-            [v["reward"].item() for v in self.buffer.values],
+            [_to_scalar(v.get("reward", 0.0)) for v in self.buffer.values],
             dtype=torch.float32,
             device=self.device,
         )
@@ -597,6 +618,12 @@ class PPOEALTrainer:
 
         # ------------------------------------------------------------------
         # Constraint GAEs + phi_c estimates (constant during policy epochs)
+        #
+        # Note on scaling invariant (F6):
+        # - phi_c_estimates are computed from raw c_adv means (averaged over LEGAL actions)
+        #   to drive dual ascent dynamics calibrated to dual_alpha.
+        # - In the policy gradient below, constraint advantages are normalized
+        #   (unit std) and divided by the constraint count to prevent gradient explosion.
         # ------------------------------------------------------------------
         phi_c_estimates: dict[str, float] = {}
         j_c_pi_k: dict[str, float] = {}
@@ -608,29 +635,38 @@ class PPOEALTrainer:
             constraint_advs_dict[name] = c_advs
             # Constraint critic targets: raw GAE advantages + stored V_c(s_t).
             c_values = torch.tensor(
-                [v.get(name, torch.tensor(0.0)).item() for v in self.buffer.values],
+                [_to_scalar(v.get(name, 0.0)) for v in self.buffer.values],
                 dtype=torch.float32,
                 device=self.device,
             )
             constraint_returns[name] = c_advs + c_values
-            j_c = float(torch.tensor(
-                [s.get(name, 0.0) for s in self.buffer.costs],
+            costs_tensor = torch.tensor(
+                [_to_scalar(s.get(name, 0.0)) for s in self.buffer.costs],
                 device=self.device,
-            ).mean())
+            )
+            j_c = float((costs_tensor * legal_flags).sum() / legal_count)
             j_c_pi_k[name] = j_c
             budget = self.cfg.constraint_budgets.get(name, 0.0)
-            phi = j_c + (1.0 / (1.0 - gamma)) * float(c_advs.mean()) - budget
+            c_adv_legal_mean = float((c_advs * legal_flags).sum() / legal_count)
+            phi = j_c + (1.0 / (1.0 - gamma)) * c_adv_legal_mean - budget
             phi_c_estimates[name] = phi
+
+        # Pre-normalize constraint advantages for policy gradient (F3)
+        c_advs_norm_dict: dict[str, torch.Tensor] = {}
+        for cname in self.cfg.constraint_names:
+            c_adv_raw = constraint_advs_dict[cname]
+            c_adv_std = c_adv_raw.std().clamp(min=1e-6)
+            c_advs_norm_dict[cname] = c_adv_raw / c_adv_std
+
+        num_constraints = max(len(self.cfg.constraint_names), 1)
 
         lambdas_float = self.dual_updater.lambdas
         lambdas = {
             k: torch.tensor(v, device=self.device)
             for k, v in lambdas_float.items()
         }
-        sigma = self.cfg.sigma
 
         old_log_probs = torch.stack(self.buffer.log_probs).detach()
-        T = len(self.buffer)
 
         total_policy_loss = 0.0
         total_value_loss = 0.0
@@ -661,6 +697,7 @@ class PPOEALTrainer:
                     # ---- reconstruct / move inputs to GPU -----------------
                     z_star = obs_i.get("z_star")
                     Z_placed = obs_i.get("Z_placed")
+                    design = obs_i.get("design")
                     design_json = obs_i.get("design_json")
                     active_idx = obs_i.get("active_idx")
                     placed_indices = obs_i.get("placed_indices")
@@ -670,9 +707,10 @@ class PPOEALTrainer:
                             Z_placed is not None and torch.is_tensor(Z_placed)):
                         z_star = z_star.to(device=self.device)
                         Z_placed = Z_placed.to(device=self.device)
-                    elif (design_json is not None and active_idx is not None
+                    elif ((design is not None or design_json is not None) and active_idx is not None
                             and placed_indices is not None):
-                        design = json.loads(design_json)
+                        if design is None and design_json is not None:
+                            design = json.loads(design_json)
                         _, z_star, Z_placed = encode_design(
                             design, self.encoder, active_idx, placed_indices
                         )
@@ -685,7 +723,7 @@ class PPOEALTrainer:
                     else:
                         F_pair = torch.zeros(0, self.cfg.pair_dim, device=self.device)
 
-                    grid_xy = obs_i["grid_xy"]
+                    grid_xy = self.buffer.grid_xys[i] if i < len(self.buffer.grid_xys) else obs_i["grid_xy"]
                     mask = self.buffer.action_masks[i]
                     if torch.is_tensor(grid_xy) and grid_xy.device != self.device:
                         grid_xy = grid_xy.to(device=self.device)
@@ -708,23 +746,12 @@ class PPOEALTrainer:
                     surr_i = torch.minimum(unclipped, clipped)
 
                     # Constraint penalty via linear Lagrangian:
-                    # sum_c lambda_c * ratio * A_c_i
-                    #
-                    # IMPORTANT: c_adv_i is normalised to unit std before
-                    # entering the policy gradient.  This decouples the
-                    # 100x-amplified scale (1/(1-gamma)) that dominates phi_c
-                    # from the actual gradient step, preventing policy_loss
-                    # from swinging by 0-500k per iteration.
-                    #
-                    # The dual update (phi_c_estimates, line ~746) is computed
-                    # from the RAW c_adv means -- that path is untouched so
-                    # lambda dynamics are unaffected.
+                    # (1 / |C|) * sum_c lambda_c * ratio * A_c_i (normalized across constraints, F2)
                     constraint_penalty_i = torch.zeros((), device=self.device)
                     for cname in self.cfg.constraint_names:
-                        c_adv_raw = constraint_advs_dict[cname]
-                        c_adv_std = c_adv_raw.std().clamp(min=1e-6)
-                        c_adv_i = c_adv_raw[i] / c_adv_std  # unit-std, same sign
+                        c_adv_i = c_advs_norm_dict[cname][i]
                         constraint_penalty_i = constraint_penalty_i + lambdas[cname] * ratio * c_adv_i
+                    constraint_penalty_i = constraint_penalty_i / num_constraints
 
                     # Scale by batch size so the mean gradient is preserved
                     policy_loss_i = (-surr_i + constraint_penalty_i) / batch_size
@@ -733,14 +760,9 @@ class PPOEALTrainer:
                     batch_constraint_pen += constraint_penalty_i.item()
 
                     # ---- value forward: reward critic + constraint critics ----
-                    # Mirror _compute_value logic: Z_placed, dummy row if empty.
-                    # IMPORTANT: both reward AND constraint critics must be trained
-                    # here.  Untrained constraint critics produce random V_c(s),
-                    # which corrupts GAE deltas and inflates phi_c by ~100x via
-                    # the 1/(1-gamma) amplification in constraint_surrogate().
                     Z_v = Z_placed
                     if Z_v.shape[0] == 0:
-                        Z_v = torch.zeros(1, self.cfg.d, device=self.device)
+                        Z_v = torch.zeros(0, self.cfg.d, device=self.device)
                     v_preds = self.value_heads(Z_v)
 
                     # Reward critic loss.
@@ -780,7 +802,7 @@ class PPOEALTrainer:
             "phi_c": phi_c_estimates,
             "j_c": j_c_pi_k,           # raw per-step cost mean (should be small)
             "c_adv_mean": {             # GAE advantage mean per constraint
-                name: float(constraint_advs_dict[name].mean())
+                name: float((constraint_advs_dict[name] * legal_flags).sum() / legal_count)
                 for name in self.cfg.constraint_names
             },
             "policy_loss": total_policy_loss,

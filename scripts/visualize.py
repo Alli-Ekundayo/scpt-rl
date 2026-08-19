@@ -303,12 +303,46 @@ def plot_bc_loss_curve(records: list[dict], out_dir: Path) -> Path | None:
     return out
 
 
+def _prepare_viz_obs(env, obs: dict, encoder, d: int, pair_dim: int) -> dict:
+    """Build complete policy inputs (z_star, Z_placed, F_pair) for visualization rollouts."""
+    import torch
+    from scpt.model.gnn_encoder import encode_design
+    from scpt.training.data import build_pair_features
+
+    prepared = dict(obs)
+    design = getattr(env, "state", None).design if getattr(env, "state", None) is not None else None
+    active_idx = env.current_active_index() if hasattr(env, "current_active_index") else None
+    placed_indices = env.current_placed_indices() if hasattr(env, "current_placed_indices") else []
+
+    if design is not None and encoder is not None and active_idx is not None:
+        with torch.no_grad():
+            _, z_star, Z_placed = encode_design(design, encoder, active_idx, placed_indices)
+        pair_features = build_pair_features(design, active_idx, placed_indices)
+        if pair_features.shape[-1] != pair_dim:
+            F_pair = torch.zeros(len(placed_indices), pair_dim)
+            if pair_features.numel() > 0:
+                cols = min(pair_dim, pair_features.shape[-1])
+                F_pair[:, :cols] = pair_features[:, :cols]
+        else:
+            F_pair = pair_features
+    else:
+        z_star = torch.zeros(d)
+        Z_placed = torch.zeros(len(placed_indices), d)
+        F_pair = torch.zeros(len(placed_indices), pair_dim)
+
+    prepared["z_star"] = z_star
+    prepared["Z_placed"] = Z_placed
+    prepared["F_pair"] = F_pair
+    return prepared
+
+
 def plot_placement_heatmap(
     policy,
     board_path: str,
     cfg: SimpleNamespace,
     out_dir: Path,
     n_episodes: int = 10,
+    encoder=None,
 ) -> Path | None:
     """Run n_episodes rollouts and heatmap where components get placed."""
     import torch
@@ -332,14 +366,18 @@ def plot_placement_heatmap(
     pair_dim = cfg.model.pair_dim
 
     policy.eval()
+    if encoder is not None:
+        encoder.eval()
+
     with torch.no_grad():
         for ep in range(n_episodes):
             obs, _ = env.reset()
+            obs = _prepare_viz_obs(env, obs, encoder, d, pair_dim)
             done = False
             while not done:
-                z_star = obs.get("z_star", torch.zeros(d))
-                Z_placed = obs.get("Z_placed", torch.zeros(0, d))
-                F_pair = obs.get("F_pair", torch.zeros(0, pair_dim))
+                z_star = obs["z_star"]
+                Z_placed = obs["Z_placed"]
+                F_pair = obs["F_pair"]
                 grid_xy = torch.as_tensor(obs["grid_xy"], dtype=torch.float32)
                 action_mask = torch.as_tensor(obs["action_mask"], dtype=torch.float32)
                 logits = policy(z_star, Z_placed, F_pair, grid_xy, action_mask)
@@ -348,6 +386,7 @@ def plot_placement_heatmap(
                 if 0 <= row < H and 0 <= col < W:
                     counts[row, col] += 1
                 obs, _, terminated, truncated, _ = env.step(action)
+                obs = _prepare_viz_obs(env, obs, encoder, d, pair_dim)
                 done = terminated or truncated
 
     fig, ax = plt.subplots(figsize=(8, 6))
@@ -430,18 +469,11 @@ def main(argv: list[str] | None = None) -> None:
             print("--heatmap requires --checkpoint, --config, and --board")
             sys.exit(1)
 
-        import yaml
+        from scpt.utils import dict_to_ns as _dict_to_ns, load_cfg as _load_cfg
         from scpt.model.scpt_transformer import SCPTPolicy
         from scpt.model.value_heads import ValueHeads
 
-        def _dict_to_ns(d):
-            ns = SimpleNamespace()
-            for k, v in d.items():
-                setattr(ns, k, _dict_to_ns(v) if isinstance(v, dict) else v)
-            return ns
-
-        with open(args.config) as f:
-            cfg = _dict_to_ns(yaml.safe_load(f))
+        cfg = _load_cfg(args.config)
 
         import torch
         ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -455,7 +487,17 @@ def main(argv: list[str] | None = None) -> None:
         policy = SCPTPolicy(d=model_d, pair_dim=model_pair_dim, n_heads=model_n_heads, n_layers=model_n_layers)
         policy.load_state_dict(ckpt["policy_state"])
 
-        plot_placement_heatmap(policy, args.board, cfg, out_dir, n_episodes=args.heatmap_episodes)
+        encoder = None
+        if "encoder_state" in ckpt and ckpt["encoder_state"] is not None:
+            from scpt.model.gnn_encoder import HeteroPCBEncoder
+            encoder = HeteroPCBEncoder(
+                node_dims={"component": 5, "pad": 4, "net": 6},
+                hidden=model_d,
+            )
+            encoder.load_state_dict(ckpt["encoder_state"])
+            encoder.eval()
+
+        plot_placement_heatmap(policy, args.board, cfg, out_dir, n_episodes=args.heatmap_episodes, encoder=encoder)
 
     logger.info("All plots written to %s/", out_dir)
 

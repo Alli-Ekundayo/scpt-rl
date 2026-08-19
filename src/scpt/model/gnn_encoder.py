@@ -186,7 +186,11 @@ def encode_design(
 
 
 def _polygon_area(courtyard: dict[str, Any]) -> float:
-    """Unsigned area via shoelace."""
+    """Unsigned area of a simple polygon via the shoelace formula.
+
+    Assumes the courtyard polygon is simple (non-self-intersecting) and
+    coplanar, as produced by standard KiCad footprint parser outputs.
+    """
     pts = courtyard.get("points", [])
     if len(pts) < 3:
         return 0.0

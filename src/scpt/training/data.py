@@ -140,8 +140,8 @@ def find_symmetry_pairs(
 ) -> list[tuple[str, str]]:
     """Return pairs of components that should be symmetric:
     - diff-pair partners (from nets with `diff_pair_id` set)
-    - matched resistor/capacitor pairs in the same cluster (same value prefix
-      + same cluster, e.g. R1+R2, C3+C4)
+    - matched resistor/capacitor pairs in the same cluster (same ref_des prefix
+      letter 'R' or 'C' + same cluster, e.g. R1+R2, C3+C4)
     """
     seen_pairs: set[tuple[str, str]] = set()
 

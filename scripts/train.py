@@ -46,27 +46,7 @@ logger = logging.getLogger("scpt.train")
 # Config helpers
 # ---------------------------------------------------------------------------
 
-def _load_cfg(path: str) -> SimpleNamespace:
-    """Load a YAML config file into a SimpleNamespace (dot-access)."""
-    with open(path) as f:
-        raw = yaml.safe_load(f)
-    return _dict_to_ns(raw)
-
-
-def _dict_to_ns(d: dict) -> SimpleNamespace:
-    """Recursively convert dicts → SimpleNamespace for dot-access."""
-    ns = SimpleNamespace()
-    for k, v in d.items():
-        setattr(ns, k, _dict_to_ns(v) if isinstance(v, dict) else v)
-    return ns
-
-
-def _ns_to_dict(ns: SimpleNamespace) -> dict:
-    """Convert SimpleNamespace back to plain dict for serialisation."""
-    out = {}
-    for k, v in vars(ns).items():
-        out[k] = _ns_to_dict(v) if isinstance(v, SimpleNamespace) else v
-    return out
+from scpt.utils import dict_to_ns as _dict_to_ns, load_cfg as _load_cfg, ns_to_dict as _ns_to_dict
 
 
 # ---------------------------------------------------------------------------

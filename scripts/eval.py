@@ -41,17 +41,7 @@ logger = logging.getLogger("scpt.eval")
 # Config helpers (mirrors train.py)
 # ---------------------------------------------------------------------------
 
-def _load_cfg(path: str) -> SimpleNamespace:
-    with open(path) as f:
-        raw = yaml.safe_load(f)
-    return _dict_to_ns(raw)
-
-
-def _dict_to_ns(d: dict) -> SimpleNamespace:
-    ns = SimpleNamespace()
-    for k, v in d.items():
-        setattr(ns, k, _dict_to_ns(v) if isinstance(v, dict) else v)
-    return ns
+from scpt.utils import dict_to_ns as _dict_to_ns, load_cfg as _load_cfg
 
 
 def _select_device() -> torch.device:
@@ -164,7 +154,7 @@ def _sample_action(policy, obs: dict) -> int:
 
 
 def eval_episode(policy, encoder, env, d: int, pair_dim: int) -> dict[str, Any]:
-    """Run one full episode. Returns per-episode stats."""
+    """Run one full episode under greedy rollout. Returns per-episode stats."""
     obs, _ = env.reset()
     obs = _prepare_obs(env, obs, encoder, d, pair_dim)
     done = False
@@ -191,7 +181,11 @@ def eval_episode(policy, encoder, env, d: int, pair_dim: int) -> dict[str, Any]:
 
 
 def eval_bc(policy, board_paths: list[str], cfg: SimpleNamespace, model_d: int, model_pair_dim: int) -> float | None:
-    """Compute BC eval loss. Returns None if not possible (e.g., no boards)."""
+    """Compute BC eval loss under expert supervision (teacher forcing).
+
+    Note: BC loss measures distance from expert actions along expert trajectories,
+    which differs from the reward/costs obtained during autonomous greedy rollouts.
+    """
     try:
         from scpt.training.bc_pretrain import BCDataset, eval_bc_loss
 

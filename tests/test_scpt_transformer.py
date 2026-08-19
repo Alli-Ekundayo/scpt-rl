@@ -105,3 +105,24 @@ def test_forward_all_cells_illegal_returns_all_neg_inf():
     mask = torch.zeros(L)  # all illegal
     logits = pol(z_star, Z_placed, F_pair, grid_xy, mask)
     assert (logits == float("-inf")).all()
+
+
+def test_forward_empty_context_gradient_flow():
+    """When P=0, gradients must flow through the learnable empty_context parameter."""
+    pol = SCPTPolicy(d=32, pair_dim=14, n_heads=2, n_layers=1)
+    L = 4
+    z_star = torch.randn(32, requires_grad=True)
+    Z_placed = torch.zeros(0, 32)
+    F_pair = torch.zeros(0, 14)
+    grid_xy = torch.randn(L, 2)
+    mask = torch.ones(L)
+
+    logits = pol(z_star, Z_placed, F_pair, grid_xy, mask)
+    loss = logits[0]
+    loss.backward()
+
+    assert pol.empty_context.grad is not None
+    assert torch.isfinite(pol.empty_context.grad).all()
+    assert z_star.grad is not None
+    assert torch.isfinite(z_star.grad).all()
+

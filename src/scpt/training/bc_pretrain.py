@@ -114,7 +114,8 @@ class BCDataset:
         pair_dim = self.cfg.pair_dim
 
         steps: list[dict] = []
-        placed_indices: list[int] = []
+        placed_comp_indices: list[int] = []
+        placed_cells: set[int] = set()
 
         for step_idx, comp_idx in enumerate(order):
             comp = components[comp_idx]
@@ -138,14 +139,14 @@ class BCDataset:
 
             # Build stub observation (no Rust wheel needed for BC).
             z_star = torch.zeros(d)
-            Z_placed = torch.zeros(max(len(placed_indices), 1), d)
-            F_pair = torch.zeros(max(len(placed_indices), 1), pair_dim)
+            Z_placed = torch.zeros(max(len(placed_comp_indices), 1), d)
+            F_pair = torch.zeros(max(len(placed_comp_indices), 1), pair_dim)
 
             # Simple action mask: mark already-placed cells as illegal.
             action_mask = torch.ones(grid_cells)
-            for placed_idx in placed_indices:
-                if placed_idx < grid_cells:
-                    action_mask[placed_idx] = 0.0
+            for cell_idx in placed_cells:
+                if 0 <= cell_idx < grid_cells:
+                    action_mask[cell_idx] = 0.0
 
             # Check if expert cell is legal.
             if action_mask[expert_action] < 0.5:
@@ -154,7 +155,8 @@ class BCDataset:
                     board_path_str, ref_des, expert_action,
                 )
                 # Still advance the episode state.
-                placed_indices.append(expert_action)
+                placed_comp_indices.append(comp_idx)
+                placed_cells.add(expert_action)
                 continue
 
             obs = {
@@ -170,7 +172,8 @@ class BCDataset:
                 "board_path": board_path_str,
                 "ref_des": ref_des,
             })
-            placed_indices.append(expert_action)
+            placed_comp_indices.append(comp_idx)
+            placed_cells.add(expert_action)
 
         return BCEpisode(steps=steps) if steps else None
 

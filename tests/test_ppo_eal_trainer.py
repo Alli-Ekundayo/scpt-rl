@@ -1,10 +1,11 @@
 """Tests for PPOEALTrainer.
 
 Key invariants verified:
-1. Rollout buffer stores action_masks per step (never recomputed during loss).
+1. Rollout buffer stores action_masks and grid_xys per step (never recomputed during loss).
 2. `update()` returns a diagnostics dict with reward_mean and phi_c keys.
 3. Loss step runs without crashing (smoke test).
 4. Constraint GAE averages only over legal actions (mask-filtered).
+5. Value computation after reset produces finite scalar tensors.
 """
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ import pytest
 from scpt.agent.ppo_eal import PPOEALTrainer, RolloutBuffer
 from scpt.model.scpt_transformer import SCPTPolicy
 from scpt.model.value_heads import ValueHeads
+from conftest import FakeEnv
 
 
 # ---------------------------------------------------------------------------
@@ -53,40 +55,6 @@ def _default_cfg(**overrides) -> SimpleNamespace:
     return cfg
 
 
-class _FakeEnv:
-    """Minimal stub env for trainer tests — no Rust required."""
-
-    def __init__(self, n_comps: int = 3, grid_cells: int = 16, d: int = 32):
-        self.n_comps = n_comps
-        self.grid_cells = grid_cells
-        self.d = d
-        self._step = 0
-
-    def reset(self, seed=None):
-        self._step = 0
-        return self._obs(), {}
-
-    def step(self, action: int):
-        self._step += 1
-        terminated = self._step >= self.n_comps
-        reward = 0.1 - 0.05 * (action / self.grid_cells)
-        costs = {"c_hpwl": 0.1}
-        return self._obs(), reward, terminated, False, {"costs": costs}
-
-    def _obs(self):
-        mask = np.ones(self.grid_cells, dtype=np.float32)
-        # Make a few cells illegal.
-        mask[0] = 0.0
-        mask[-1] = 0.0
-        return {
-            "action_mask": mask,
-            "grid_xy": np.random.randn(self.grid_cells, 2).astype(np.float32),
-            "z_star": np.random.randn(self.d).astype(np.float32),
-            "Z_placed": np.random.randn(max(self._step, 1), self.d).astype(np.float32),
-            "F_pair": np.random.randn(max(self._step, 1), 4).astype(np.float32),
-        }
-
-
 # ---------------------------------------------------------------------------
 # RolloutBuffer tests
 # ---------------------------------------------------------------------------
@@ -99,110 +67,172 @@ def test_rollout_buffer_stores_masks():
              "F_pair": torch.zeros(0, 4), "grid_xy": torch.zeros(3, 2),
              "action_mask": mask},
         action=0,
-        log_prob=torch.tensor(-1.0),
-        reward=0.5,
-        value={"reward": torch.tensor(0.3), "c_hpwl": torch.tensor(0.1)},
+        log_prob=torch.tensor(-0.5),
+        reward=1.0,
+        value={"reward": torch.tensor(0.5), "c_hpwl": torch.tensor(0.1)},
         costs={"c_hpwl": 0.2},
         done=False,
     )
-    assert len(buf.action_masks) == 1
-    assert torch.allclose(buf.action_masks[0], mask)
+    assert len(buf) == 1
+    assert torch.equal(buf.action_masks[0], mask)
+    assert torch.equal(buf.grid_xys[0], torch.zeros(3, 2))
 
 
-def test_rollout_buffer_clear_resets():
+def test_rollout_buffer_clear():
     buf = RolloutBuffer(constraint_names=["c_hpwl"])
     buf.add(
         obs={"z_star": torch.zeros(8), "Z_placed": torch.zeros(0, 8),
              "F_pair": torch.zeros(0, 4), "grid_xy": torch.zeros(3, 2),
-             "action_mask": torch.ones(3)},
-        action=1,
+             "action_mask": torch.tensor([1.0])},
+        action=0,
         log_prob=torch.tensor(-0.5),
         reward=1.0,
-        value={"reward": torch.tensor(0.5), "c_hpwl": torch.tensor(0.2)},
-        costs={"c_hpwl": 0.1},
-        done=True,
+        value={"reward": torch.tensor(0.5)},
+        costs={},
+        done=False,
     )
+    assert len(buf) == 1
     buf.clear()
+    assert len(buf) == 0
     assert len(buf.action_masks) == 0
-    assert len(buf.rewards) == 0
+    assert len(buf.grid_xys) == 0
 
 
 # ---------------------------------------------------------------------------
-# PPOEALTrainer smoke tests
+# Trainer smoke test
 # ---------------------------------------------------------------------------
 
-def test_collect_rollout_fills_buffer():
+def test_trainer_collect_rollout_fills_buffer():
     policy = _make_policy()
     vh = _make_value_heads()
     cfg = _default_cfg()
     trainer = PPOEALTrainer(policy, vh, cfg)
-    env = _FakeEnv()
+    env = FakeEnv(n_comps=5, grid_cells=16)
 
-    n = 6
-    trainer.collect_rollout(env, n_steps=n)
-    # Buffer should have ≤ n steps (may terminate early if episode ends).
-    assert len(trainer.buffer.rewards) <= n
-    assert len(trainer.buffer.rewards) > 0
+    trainer.collect_rollout(env, n_steps=10)
+    assert len(trainer.buffer) == 10
+    assert len(trainer.buffer.obs_list) == 10
+    assert len(trainer.buffer.action_masks) == 10
+    assert len(trainer.buffer.grid_xys) == 10
 
 
-def test_update_returns_diagnostics():
+def test_trainer_update_returns_diagnostics():
     policy = _make_policy()
     vh = _make_value_heads()
     cfg = _default_cfg()
     trainer = PPOEALTrainer(policy, vh, cfg)
-    env = _FakeEnv()
+    env = FakeEnv(n_comps=4, grid_cells=16)
 
-    diag = trainer.update(env, n_steps=12)
+    diag = trainer.update(env, n_steps=8)
     assert "reward_mean" in diag
     assert "phi_c" in diag
     assert "c_hpwl" in diag["phi_c"]
+    assert "policy_loss" in diag
+    assert "value_loss" in diag
+    assert "lambdas" in diag
+    assert "c_adv_mean" in diag
+    assert "j_c" in diag
 
 
-def test_update_does_not_crash_multiple_times():
+def test_trainer_multiple_constraints_diagnostics():
+    cnames = ["c_hpwl", "c_clearance", "c_partition"]
     policy = _make_policy()
-    vh = _make_value_heads()
-    cfg = _default_cfg(epochs=2)
+    vh = _make_value_heads(constraint_names=cnames)
+    cfg = _default_cfg(
+        constraint_names=cnames,
+        constraint_budgets={c: 0.1 for c in cnames},
+    )
     trainer = PPOEALTrainer(policy, vh, cfg)
-    env = _FakeEnv()
+    env = FakeEnv(n_comps=4, grid_cells=16)
 
-    for _ in range(3):
-        trainer.update(env, n_steps=8)
+    diag = trainer.update(env, n_steps=8)
+    for c in cnames:
+        assert c in diag["phi_c"]
+        assert c in diag["lambdas"]
+        assert c in diag["c_adv_mean"]
+        assert c in diag["j_c"]
 
 
-def test_mask_stored_not_recomputed():
-    """Masks in the buffer must be the ones from obs, not recomputed."""
+def test_trainer_stores_action_masks_not_stale():
+    """Action masks in the buffer must be snapshots at collection time."""
     policy = _make_policy()
     vh = _make_value_heads()
     cfg = _default_cfg()
     trainer = PPOEALTrainer(policy, vh, cfg)
-    env = _FakeEnv()
+    env = FakeEnv(n_comps=3, grid_cells=8)
 
     trainer.collect_rollout(env, n_steps=4)
-    # The FakeEnv always has cells 0 and -1 illegal → masks in buffer should reflect that.
+    # The FakeEnv always has cells 0 and -1 illegal -> masks in buffer should reflect that.
     for mask in trainer.buffer.action_masks:
         assert mask[0].item() == 0.0
         assert mask[-1].item() == 0.0
 
 
-def test_constraint_gae_uses_legal_only():
-    """Constraint GAE must only average over legal actions.
-    
-    We verify this indirectly: if a buffer step has all cells illegal except one,
-    the advantage is dominated by that one cell, not diluted by the -inf logprobs
-    of illegal cells.
-    """
+def test_constraint_gae_masks_illegal_actions():
+    """Constraint GAE must zero out illegal actions and not crash."""
     policy = _make_policy()
     vh = _make_value_heads()
     cfg = _default_cfg()
     trainer = PPOEALTrainer(policy, vh, cfg)
-    env = _FakeEnv()
 
-    trainer.collect_rollout(env, n_steps=6)
-    # After collect, we can call _compute_constraint_gae and check it doesn't error.
+    # Manually populate buffer with 1 legal and 1 illegal action
+    mask_step0 = torch.tensor([1.0, 0.0, 0.0, 0.0])  # cell 0 legal
+    mask_step1 = torch.tensor([1.0, 0.0, 0.0, 0.0])  # cell 1 illegal
+
+    trainer.buffer.clear()
+    # Step 0: action 0 (legal)
+    trainer.buffer.add(
+        obs={"z_star": torch.zeros(32), "Z_placed": torch.zeros(0, 32),
+             "F_pair": torch.zeros(0, 4), "grid_xy": torch.zeros(4, 2),
+             "action_mask": mask_step0},
+        action=0,
+        log_prob=torch.tensor(-0.1),
+        reward=1.0,
+        value={"c_hpwl": torch.tensor(1.0), "reward": torch.tensor(1.0)},
+        costs={"c_hpwl": 2.0},
+        done=False,
+    )
+    # Step 1: action 1 (illegal according to mask_step1)
+    trainer.buffer.add(
+        obs={"z_star": torch.zeros(32), "Z_placed": torch.zeros(1, 32),
+             "F_pair": torch.zeros(1, 4), "grid_xy": torch.zeros(4, 2),
+             "action_mask": mask_step1},
+        action=1,  # illegal!
+        log_prob=torch.tensor(-10.0),
+        reward=0.0,
+        value={"c_hpwl": torch.tensor(1.0), "reward": torch.tensor(0.0)},
+        costs={"c_hpwl": 50.0},
+        done=True,
+    )
+
     advantages = trainer._compute_constraint_gae(
         "c_hpwl",
         next_value=torch.tensor(0.0),
         gamma=cfg.gamma,
         gae_lambda=cfg.gae_lambda,
     )
-    assert advantages.shape[0] == len(trainer.buffer.rewards)
+    assert advantages.shape[0] == 2
+    # Step 1 was illegal action, so advantages[1] must be zeroed out
+    assert advantages[1].item() == 0.0
+    # Step 0 was legal, so advantages[0] is finite
+    assert torch.isfinite(advantages[0])
+
+
+def test_compute_value_after_reset_finite():
+    """Verify _compute_value on step 0 (P=0) returns finite outputs without NaNs."""
+    policy = _make_policy()
+    vh = _make_value_heads(constraint_names=["c_hpwl", "c_clearance"])
+    cfg = _default_cfg(constraint_names=["c_hpwl", "c_clearance"])
+    trainer = PPOEALTrainer(policy, vh, cfg)
+    env = FakeEnv(n_comps=3, grid_cells=16)
+
+    obs, _ = env.reset()
+    prepared_obs = trainer._prepare_obs(env, obs)
+    v_dict = trainer._compute_value(prepared_obs)
+
+    assert "reward" in v_dict
+    assert torch.isfinite(v_dict["reward"])
+    assert "c_hpwl" in v_dict
+    assert torch.isfinite(v_dict["c_hpwl"])
+    assert "c_clearance" in v_dict
+    assert torch.isfinite(v_dict["c_clearance"])

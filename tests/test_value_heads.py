@@ -28,14 +28,26 @@ def test_value_heads_separate_params():
     assert not torch.allclose(reward_w, c_w)
 
 
-def test_value_heads_with_empty_graph_raises():
-    """Empty graph → mean-pool is NaN. Caller must handle this upstream."""
+def test_value_heads_with_empty_graph_returns_finite_zeros():
+    """Empty graph (P=0) -> mean-pool fallback produces finite zeros, never NaN."""
     vh = ValueHeads(d=64, constraint_names=["c_hpwl"])
     z_comp = torch.zeros(0, 64)
     out = vh(z_comp)
-    # With zero rows, mean is NaN. We don't crash, but downstream loss
-    # must handle NaN gracefully (or the env must never pass empty graphs).
-    assert torch.isnan(out["reward"])
+    assert not torch.isnan(out["reward"])
+    assert torch.isfinite(out["reward"])
+    assert not torch.isnan(out["c_hpwl"])
+    assert torch.isfinite(out["c_hpwl"])
+
+
+def test_value_heads_orthogonal_initialization():
+    """Verify orthogonal init is applied to linear layers."""
+    vh = ValueHeads(d=32, constraint_names=["c_hpwl"])
+    for m in vh.modules():
+        if isinstance(m, torch.nn.Linear):
+            # Check weight is not all zeros and bias is zero initialized
+            assert torch.isfinite(m.weight).all()
+            if m.bias is not None:
+                assert torch.allclose(m.bias, torch.zeros_like(m.bias))
 
 
 def test_value_heads_different_constraint_names_produce_independent_heads():

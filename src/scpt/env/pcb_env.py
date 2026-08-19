@@ -165,8 +165,8 @@ class PcbPlacementEnv(gym.Env):
         # brings the reward to O(−10), commensurate with normalised advantages.
         # Constraint costs (clearance, partition) are handled exclusively
         # by the PPO-EAL Lagrangian — not subtracted from reward.
-        _bounds = st.design["board"]["bounds"]
-        board_diag = math.sqrt(_bounds["w"] ** 2 + _bounds["h"] ** 2)
+        bounds = st.design["board"]["bounds"]
+        board_diag = math.sqrt(bounds["w"] ** 2 + bounds["h"] ** 2)
         reward = -costs.get("c_hpwl", 0.0) / max(board_diag, 1.0)
 
         terminated = st.placed_count == len(st.placement_order)

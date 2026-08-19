@@ -63,6 +63,9 @@ scpt-rl/
 │   └── build_rust.sh              # Build Rust wheel via maturin
 ├── configs/
 │   ├── default.yaml               # Full-scale training config
+│   ├── default_low_batch.yaml     # Low-memory training profile (small minibatches)
+│   ├── default_low_batch2.yaml    # Alternate low-memory profile
+│   ├── default_high_res.yaml      # High-resolution placement grid config
 │   └── smoke.yaml                 # Tiny CI / dev smoke-test config
 ├── tests/
 │   ├── conftest.py                # Shared fixtures (designs, models, FakeEnv)
@@ -175,6 +178,10 @@ python scripts/eval.py \
 
 Reports: mean reward, BC eval loss, constraint costs, per-board breakdown, and
 the Lagrangian multiplier values frozen in the checkpoint.
+
+> **Note on Metrics:** BC eval loss measures distance from expert demonstrations
+> under teacher-forcing supervision, whereas rollout reward measures autonomous
+> policy placement quality under greedy execution.
 
 ---
 

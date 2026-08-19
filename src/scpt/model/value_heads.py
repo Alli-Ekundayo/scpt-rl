@@ -26,6 +26,7 @@ class ValueHeads(nn.Module):
     """
     def __init__(self, d: int, constraint_names: list[str]):
         super().__init__()
+        self.d = d
         self.constraint_names = list(constraint_names)
         self.reward_critic = nn.Sequential(
             nn.Linear(d, d),
@@ -40,6 +41,15 @@ class ValueHeads(nn.Module):
             )
             for name in constraint_names
         })
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        """Orthogonal initialization for value heads with small gain."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=0.1)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, z_comp: torch.Tensor) -> dict[str, torch.Tensor]:
         """Graph-level readout (mean-pool v1) → separate critic values.
@@ -52,7 +62,10 @@ class ValueHeads(nn.Module):
         Returns:
             dict mapping "reward" + each constraint name → scalar tensor.
         """
-        g = z_comp.mean(dim=0)  # (d,) graph-level readout
+        if z_comp.shape[0] == 0:
+            g = torch.zeros(self.d, device=z_comp.device, dtype=z_comp.dtype)
+        else:
+            g = z_comp.mean(dim=0)  # (d,) graph-level readout
         out = {"reward": self.reward_critic(g).squeeze(-1)}
         for name, head in self.constraint_critics.items():
             out[name] = head(g).squeeze(-1)

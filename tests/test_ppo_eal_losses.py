@@ -171,7 +171,7 @@ def test_normalize_advantages_zero_mean_unit_std():
     adv = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0])
     normed = normalize_advantages(adv)
     assert abs(normed.mean().item()) < 1e-5
-    assert abs(normed.std().item() - 1.0) < 0.1
+    assert abs(normed.std().item() - 1.0) < 1e-4
 
 
 def test_normalize_advantages_handles_constant():
