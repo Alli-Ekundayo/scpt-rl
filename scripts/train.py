@@ -240,11 +240,14 @@ def run_ppo_phase(
         constraint_names=list(cfg.ppo.constraint_names),
         constraint_budgets=_ns_to_dict(cfg.ppo.constraint_budgets),
         lr=cfg.ppo.lr,
+        # Separate LR for constraint critics (default: lr/5 if not in config).
+        constraint_critic_lr=getattr(cfg.ppo, "constraint_critic_lr", cfg.ppo.lr / 5.0),
         epochs=cfg.ppo.epochs,
         minibatch_size=cfg.ppo.minibatch_size,
         dual_alpha=cfg.ppo.dual_alpha,
         dual_ema_decay=cfg.ppo.dual_ema_decay,
     )
+
 
     trainer = PPOEALTrainer(policy, value_heads, ppo_cfg, encoder=encoder)
     start_iter = 0

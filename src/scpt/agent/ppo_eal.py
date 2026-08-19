@@ -278,10 +278,28 @@ class PPOEALTrainer:
             ema_decay=cfg.dual_ema_decay,
         )
 
-        all_params = list(policy.parameters()) + list(value_heads.parameters())
+        # Split optimizer into two param groups so the constraint critics can
+        # use a lower LR than the policy / encoder without any code change at
+        # call sites.  constraint_critic_lr defaults to lr/5 if not set.
+        constraint_critic_lr = getattr(cfg, "constraint_critic_lr", cfg.lr / 5.0)
+        policy_params = list(policy.parameters())
         if self.encoder is not None:
-            all_params += list(self.encoder.parameters())
-        self.optimizer = optim.Adam(all_params, lr=cfg.lr)
+            policy_params += list(self.encoder.parameters())
+        # Separate out only the constraint critic heads.
+        # ValueHeads stores them at self.constraint_critics.<cname>.*,
+        # so named_parameters() yields 'constraint_critics.c_clearance.weight' etc.
+        constraint_critic_params = []
+        reward_and_shared_params = []
+        for name, p in value_heads.named_parameters():
+            if name.startswith("constraint_critics."):
+                constraint_critic_params.append(p)
+            else:
+                reward_and_shared_params.append(p)
+        self.optimizer = optim.Adam([
+            {"params": policy_params + reward_and_shared_params, "lr": cfg.lr},
+            {"params": constraint_critic_params, "lr": constraint_critic_lr,
+             "name": "constraint_critics"},
+        ])
 
     # ------------------------------------------------------------------
     # Public API
@@ -691,9 +709,21 @@ class PPOEALTrainer:
 
                     # Constraint penalty via linear Lagrangian:
                     # sum_c lambda_c * ratio * A_c_i
+                    #
+                    # IMPORTANT: c_adv_i is normalised to unit std before
+                    # entering the policy gradient.  This decouples the
+                    # 100x-amplified scale (1/(1-gamma)) that dominates phi_c
+                    # from the actual gradient step, preventing policy_loss
+                    # from swinging by 0-500k per iteration.
+                    #
+                    # The dual update (phi_c_estimates, line ~746) is computed
+                    # from the RAW c_adv means -- that path is untouched so
+                    # lambda dynamics are unaffected.
                     constraint_penalty_i = torch.zeros((), device=self.device)
                     for cname in self.cfg.constraint_names:
-                        c_adv_i = constraint_advs_dict[cname][i]
+                        c_adv_raw = constraint_advs_dict[cname]
+                        c_adv_std = c_adv_raw.std().clamp(min=1e-6)
+                        c_adv_i = c_adv_raw[i] / c_adv_std  # unit-std, same sign
                         constraint_penalty_i = constraint_penalty_i + lambdas[cname] * ratio * c_adv_i
 
                     # Scale by batch size so the mean gradient is preserved

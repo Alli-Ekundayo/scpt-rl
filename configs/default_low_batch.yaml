@@ -63,6 +63,10 @@ ppo:
   gamma: 0.99
   gae_lambda: 0.95
   lr: 3.0e-4
+  # Constraint critics see a higher-variance, non-stationary target.
+  # Use a separate, lower LR so they converge without oscillating.
+  # Default in code is lr/5; override here for explicit control.
+  constraint_critic_lr: 6.0e-5
   epochs: 4
   minibatch_size: 32  # Reduced from 64 to 32
 
