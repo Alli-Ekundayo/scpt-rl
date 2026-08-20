@@ -362,6 +362,10 @@ def plot_placement_heatmap(
 
     H, W = env.H, env.W
     counts = np.zeros((H, W), dtype=np.float32)
+    # Track per-component placement coordinates and single-episode cell collisions
+    comp_positions: dict[str, list[tuple[int, int]]] = {}
+    same_episode_collisions = 0
+
     d = cfg.model.d
     pair_dim = cfg.model.pair_dim
 
@@ -374,7 +378,16 @@ def plot_placement_heatmap(
             obs, _ = env.reset()
             obs = _prepare_viz_obs(env, obs, encoder, d, pair_dim)
             done = False
+            ep_cell_comps: dict[tuple[int, int], list[str]] = {}
+
             while not done:
+                active_idx = env.current_active_index() if hasattr(env, "current_active_index") else None
+                ref_des = (
+                    env.state.design["components"][active_idx]["ref_des"]
+                    if (active_idx is not None and getattr(env, "state", None) is not None)
+                    else f"C{active_idx}"
+                )
+
                 z_star = obs["z_star"]
                 Z_placed = obs["Z_placed"]
                 F_pair = obs["F_pair"]
@@ -385,28 +398,69 @@ def plot_placement_heatmap(
                 row, col = action // W, action % W
                 if 0 <= row < H and 0 <= col < W:
                     counts[row, col] += 1
+                    comp_positions.setdefault(ref_des, []).append((col, row))
+                    ep_cell_comps.setdefault((row, col), []).append(ref_des)
+
                 obs, _, terminated, truncated, _ = env.step(action)
                 obs = _prepare_viz_obs(env, obs, encoder, d, pair_dim)
                 done = terminated or truncated
 
-    fig, ax = plt.subplots(figsize=(8, 6))
-    im = ax.imshow(
+            # Check if multiple components in the SAME episode landed in the exact same cell
+            for cell, comps in ep_cell_comps.items():
+                if len(comps) > 1:
+                    same_episode_collisions += (len(comps) - 1)
+
+    # 2-panel visualization: left = density heatmap, right = per-component location map
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+
+    im = ax1.imshow(
         counts,
         origin="upper",
         cmap="hot",
         aspect="auto",
         interpolation="nearest",
     )
-    fig.colorbar(im, ax=ax, label="Placement count")
-    ax.set_title(
-        f"Component Placement Heatmap\n({n_episodes} episodes · {Path(board_path).name})",
+    fig.colorbar(im, ax=ax1, label="Placement count")
+    ax1.set_title(
+        f"Placement Density Heatmap\n({n_episodes} ep · {Path(board_path).name})",
         fontsize=11,
     )
-    ax.set_xlabel("Grid Column (X)")
-    ax.set_ylabel("Grid Row (Y)")
+    ax1.set_xlabel("Grid Column (X)")
+    ax1.set_ylabel("Grid Row (Y)")
+
+    # Right panel: component-specific placement coordinates
+    markers = ["o", "s", "^", "D", "v", "<", ">", "p", "*", "h", "X", "P"]
+    color_palette = _PALETTE
+
+    comp_names = sorted(comp_positions.keys())
+    for idx, ref in enumerate(comp_names):
+        coords = comp_positions[ref]
+        xs = [c[0] for c in coords]
+        ys = [c[1] for c in coords]
+        m = markers[idx % len(markers)]
+        c = color_palette[idx % len(color_palette)]
+        ax2.scatter(xs, ys, label=ref, color=c, marker=m, s=60, alpha=0.85, edgecolors="none")
+
+    ax2.set_xlim(-1, W)
+    ax2.set_ylim(H, -1)  # upper origin to match imshow
+    ax2.set_xlabel("Grid Column (X)")
+    ax2.set_ylabel("Grid Row (Y)")
+    ax2.grid(True, alpha=0.3)
+
+    collision_text = (
+        f"Intra-episode cell overlaps: {same_episode_collisions}"
+        if same_episode_collisions > 0
+        else "No intra-episode cell overlaps (100% distinct cell placement)"
+    )
+    ax2.set_title(
+        f"Per-Component Placement Locations\n({collision_text})",
+        fontsize=11,
+    )
+    ax2.legend(loc="upper right", bbox_to_anchor=(1.35, 1.0), fontsize=9)
+
     fig.tight_layout()
     out = out_dir / "placement_heatmap.png"
-    fig.savefig(out, dpi=150)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved %s", out)
     return out
