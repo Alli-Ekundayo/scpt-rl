@@ -51,6 +51,10 @@ bc:
     - dataset/base_raw/PModBoard.kicad_pcb
     - dataset/base_raw/tc_logger_mcu.kicad_pcb
     - dataset/base_raw/voltage_datalogger_adc0.kicad_pcb
+    - dataset/base_raw/ATMEGA328_Motor_Board.kicad_pcb
+    - dataset/base_raw/Blixten.kicad_pcb
+    - dataset/base_raw/boatcontrol.kicad_pcb
+    - dataset/base_raw/Driverino-Shield.kicad_pcb
 
   epochs: 20
   lr: 3.0e-4
