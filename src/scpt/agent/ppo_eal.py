@@ -375,7 +375,7 @@ class PPOEALTrainer:
         """Estimate V(s) for the reward and each constraint."""
         z_star, Z_placed, F_pair, grid_xy, action_mask = self._get_policy_inputs(obs)
         if Z_placed.shape[0] == 0:
-            Z_placed = torch.zeros(0, self.cfg.d, device=self.device)
+            Z_placed = torch.zeros(1, self.cfg.d, device=self.device)
         return self.value_heads(Z_placed)
 
     def _prepare_obs(self, env, obs: dict) -> dict:
