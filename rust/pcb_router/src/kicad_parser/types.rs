@@ -25,6 +25,15 @@ pub struct Netclass {
     pub uvia_drill: f64,
 }
 
+/// Axis-aligned bounding box for the PCB board outline (in mm).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct BoardBounds {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Net {
     pub id: i32,

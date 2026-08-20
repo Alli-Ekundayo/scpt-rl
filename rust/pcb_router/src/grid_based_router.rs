@@ -156,7 +156,14 @@ impl GridBasedRouter {
     pub fn initialization(&mut self, db: &KicadPcbDatabase) {
         self.setup_layer_mapping(db);
 
-        // Compute board extents from pads
+        // Compute board extents from explicit board bounds if provided, expanded for pads
+        if let Some(ref bounds) = db.board_bounds {
+            self.min_x = bounds.x;
+            self.max_x = bounds.x + bounds.w;
+            self.min_y = bounds.y;
+            self.max_y = bounds.y + bounds.h;
+        }
+
         for pad in &db.pads {
             if pad.position.0 < self.min_x { self.min_x = pad.position.0; }
             if pad.position.0 > self.max_x { self.max_x = pad.position.0; }
@@ -164,7 +171,7 @@ impl GridBasedRouter {
             if pad.position.1 > self.max_y { self.max_y = pad.position.1; }
         }
 
-        // Add small margin if no pads
+        // Fall back to default board extents if bounds are uninitialized
         if self.min_x > self.max_x {
             self.min_x = 0.0; self.max_x = 100.0;
             self.min_y = 0.0; self.max_y = 100.0;
@@ -420,5 +427,26 @@ mod tests {
             instance_position: (0.0, 0.0),
         });
         db
+    }
+
+    #[test]
+    fn test_initialization_with_board_bounds() {
+        use crate::kicad_parser::types::BoardBounds;
+
+        let mut db = build_test_db();
+        db.board_bounds = Some(BoardBounds {
+            x: 0.0,
+            y: 0.0,
+            w: 200.0,
+            h: 150.0,
+        });
+
+        let mut router = GridBasedRouter::new(GlobalParam::default());
+        router.initialization(&db);
+
+        assert_eq!(router.min_x, 0.0);
+        assert_eq!(router.max_x, 200.0);
+        assert_eq!(router.min_y, 0.0);
+        assert_eq!(router.max_y, 150.0);
     }
 }

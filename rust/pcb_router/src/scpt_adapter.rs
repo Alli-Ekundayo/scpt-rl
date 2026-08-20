@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 
 use crate::kicad_parser::types::{
-    Instance, Layer, LayerType, Net, Netclass, Pad,
+    BoardBounds, Instance, Layer, LayerType, Net, Netclass, Pad,
 };
 use crate::kicad_parser::KicadPcbDatabase;
 
@@ -45,9 +45,7 @@ struct ScptBoard {
 struct ScptRect {
     x: f64,
     y: f64,
-    #[allow(dead_code)]
     w: f64,
-    #[allow(dead_code)]
     h: f64,
 }
 
@@ -236,5 +234,39 @@ pub fn scpt_json_to_kicad_db(design_json: &str) -> Result<KicadPcbDatabase, Stri
     db.nets = nets;
     db.instances = instances;
     db.pads = pads;
+    db.board_bounds = Some(BoardBounds {
+        x: d.board.bounds.x,
+        y: d.board.bounds.y,
+        w: d.board.bounds.w,
+        h: d.board.bounds.h,
+    });
     Ok(db)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scpt_json_to_kicad_db_board_bounds() {
+        let json_data = r#"{
+            "board": {
+                "outline": {},
+                "keepouts": [],
+                "bounds": { "x": 10.0, "y": 20.0, "w": 50.0, "h": 40.0 }
+            },
+            "components": [],
+            "nets": [],
+            "netclasses": {},
+            "placement": { "positions": [], "placement_order": [] }
+        }"#;
+
+        let db = scpt_json_to_kicad_db(json_data).expect("failed to parse JSON");
+        assert!(db.board_bounds.is_some());
+        let bounds = db.board_bounds.unwrap();
+        assert_eq!(bounds.x, 10.0);
+        assert_eq!(bounds.y, 20.0);
+        assert_eq!(bounds.w, 50.0);
+        assert_eq!(bounds.h, 40.0);
+    }
 }

@@ -116,6 +116,8 @@ pub struct KicadPcbDatabase {
     pub instances: Vec<Instance>,
     /// All pads from all instances, including their absolute position.
     pub pads: Vec<Pad>,
+    /// Explicit board bounding box (if available).
+    pub board_bounds: Option<BoardBounds>,
     /// Original document for native write support.
     pub doc: Option<PcbDocument>,
     new_segments: Vec<PcbSegment>,
