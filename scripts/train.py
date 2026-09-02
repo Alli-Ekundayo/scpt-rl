@@ -192,6 +192,18 @@ def run_bc_phase(policy: torch.nn.Module, cfg: SimpleNamespace, use_wandb: bool,
 # Phase 2: PPO-EAL loop
 # ---------------------------------------------------------------------------
 
+def _build_bc_cfg(cfg: SimpleNamespace) -> SimpleNamespace:
+    """Construct the bc_cfg namespace needed by BCDataset / eval_bc_loss."""
+    return SimpleNamespace(
+        grid_resolution_mm=cfg.env.grid_resolution_mm,
+        min_spacing_mm=cfg.env.min_spacing_mm,
+        d=cfg.model.d,
+        pair_dim=cfg.model.pair_dim,
+        epochs=getattr(cfg.bc, "epochs", 1),
+        lr=getattr(cfg.bc, "lr", 1e-3),
+    )
+
+
 def run_ppo_phase(
     encoder,
     policy: torch.nn.Module,
@@ -291,6 +303,31 @@ def run_ppo_phase(
 
         if (outer_iter + 1) % ckpt_interval == 0:
             save_checkpoint(run_dir, encoder, policy, value_heads, trainer.dual_updater, outer_iter + 1, cfg)
+
+            # Log BC eval loss at each checkpoint so visualize.py can plot
+            # BC drift over PPO training (not just the single pretraining point).
+            bc_board_paths = list(cfg.bc.board_paths) if hasattr(cfg, "bc") and hasattr(cfg.bc, "board_paths") else []
+            if bc_board_paths and log_path is not None:
+                try:
+                    from scpt.training.bc_pretrain import BCDataset, eval_bc_loss as _eval_bc_loss
+                    _bc_cfg = _build_bc_cfg(cfg)
+                    _bc_ds = BCDataset(board_paths=bc_board_paths, cfg=_bc_cfg)
+                    if len(_bc_ds) > 0:
+                        _bc_loss = _eval_bc_loss(policy, _bc_ds, _bc_cfg)
+                        _append_jsonl(log_path, {
+                            "iter": outer_iter + 1,
+                            "bc/eval_loss": _bc_loss,
+                            "phase": "ppo",
+                        })
+                        logger.info("[%05d] BC eval loss (drift check): %.4f", outer_iter + 1, _bc_loss)
+                        if use_wandb:
+                            try:
+                                import wandb
+                                wandb.log({"bc/eval_loss": _bc_loss}, step=outer_iter + 1)
+                            except Exception:
+                                pass
+                except Exception as _bc_e:
+                    logger.warning("BC eval loss check failed: %s", _bc_e)
 
     # Final checkpoint.
     save_checkpoint(run_dir, encoder, policy, value_heads, trainer.dual_updater, n_iters, cfg)

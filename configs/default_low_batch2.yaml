@@ -35,7 +35,7 @@ bc:
   lr: 3.0e-4                  # Adam learning rate for BC
 
 ppo:
-  n_outer_iters: 1000         # number of (collect → update) outer iterations
+  n_outer_iters: 3000         # number of (collect → update) outer iterations
   n_steps_per_iter: 128       # environment steps collected per outer iter
 
   # PPO core

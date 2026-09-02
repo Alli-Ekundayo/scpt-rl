@@ -282,17 +282,79 @@ def plot_policy_loss(records: list[dict], out_dir: Path) -> Path | None:
 
 
 def plot_bc_loss_curve(records: list[dict], out_dir: Path) -> Path | None:
-    """Plot BC pretraining loss, if present in the log."""
+    """Plot BC eval loss over training.
+
+    Two series are distinguished:
+    - **BC pretraining** (``phase='bc'``): the single post-warm-start eval,
+      always at iter 0.  Appears as a star marker.
+    - **PPO-phase drift** (``phase='ppo'``): per-checkpoint BC eval recorded
+      by train.py at every ``checkpoint_interval`` during PPO.  Appears as a
+      solid line so you can watch the policy drift away from (or back toward)
+      the expert over the course of RL fine-tuning.
+
+    If only the pretraining point is present the plot still renders, but a
+    warning is emitted so a visually identical-across-runs plot is immediately
+    distinguishable from genuinely missing data.
+    """
     _apply_style()
-    iters, losses = _extract_series(records, "bc/eval_loss")
-    if not iters:
+
+    # Split records by phase so we can style them separately.
+    bc_iters, bc_losses = [], []
+    ppo_iters, ppo_losses = [], []
+    for rec in records:
+        if "bc/eval_loss" not in rec or "iter" not in rec:
+            continue
+        try:
+            it = int(rec["iter"])
+            loss = float(rec["bc/eval_loss"])
+        except (ValueError, TypeError):
+            continue
+        if rec.get("phase") == "ppo":
+            ppo_iters.append(it)
+            ppo_losses.append(loss)
+        else:
+            # phase == "bc" or absent (legacy single-point entry)
+            bc_iters.append(it)
+            bc_losses.append(loss)
+
+    if not bc_iters and not ppo_iters:
         return None
 
-    fig, ax = plt.subplots(figsize=(7, 3))
-    ax.plot(iters, losses, color=_PALETTE[4], marker="o", markersize=5, label="BC Eval Loss")
-    ax.set_xlabel("BC Epoch / Step")
-    ax.set_ylabel("Cross-Entropy Loss")
-    ax.set_title("SCPT-RL — Behavioural Cloning Pretraining Loss")
+    if ppo_iters:
+        logger.info(
+            "BC loss curve: %d pretraining point(s) + %d PPO-phase drift point(s)",
+            len(bc_iters), len(ppo_iters),
+        )
+    else:
+        logger.warning(
+            "bc_loss_curve: only the frozen BC-pretraining point is present in the log "
+            "(iter=0, loss=%.4f). PPO-phase drift measurements will appear once the next "
+            "checkpoint fires. The plot will look identical to previous runs until then.",
+            bc_losses[0] if bc_losses else float("nan"),
+        )
+
+    fig, ax = plt.subplots(figsize=(9, 4))
+
+    # PPO-phase drift — primary time-series
+    if ppo_iters:
+        ax.plot(
+            ppo_iters, ppo_losses,
+            color=_PALETTE[4], marker="o", markersize=4,
+            label="BC eval loss (PPO drift, per checkpoint)",
+        )
+        _add_ema_line(ax, ppo_iters, ppo_losses, color=_PALETTE[1], label="EMA (α=0.05)")
+
+    # BC pretraining anchor — single star
+    if bc_iters:
+        ax.scatter(
+            bc_iters, bc_losses,
+            color=_PALETTE[2], marker="*", s=120, zorder=5,
+            label=f"BC pretraining eval (iter 0, loss={bc_losses[0]:.4f})",
+        )
+
+    ax.set_xlabel("Outer PPO Iteration")
+    ax.set_ylabel("Cross-Entropy Loss (BC)")
+    ax.set_title("SCPT-RL — BC Eval Loss: pretraining anchor + PPO drift")
     ax.legend()
     ax.grid(True, alpha=0.4)
     fig.tight_layout()
