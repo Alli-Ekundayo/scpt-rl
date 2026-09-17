@@ -425,52 +425,98 @@ class Renderer3D:
         self.center_y = self.bounds["y"] + self.bh / 2.0
 
         self.pcb_th = 1.6
+
+        # Check & initialize hardware OpenGL (pyrender) or fall back to software 3D
+        self.use_pyrender = False
+        if HAS_PYRENDER:
+            try:
+                # Patch PyRender EGL device query for Docker / Kaggle containers
+                try:
+                    import pyrender.platforms.egl as pyrender_egl
+                    orig_query = pyrender_egl.query_devices
+                    def safe_query_devices():
+                        devs = orig_query()
+                        return devs if devs else [pyrender_egl.EGLDevice(None)]
+                    pyrender_egl.query_devices = safe_query_devices
+                except Exception:
+                    pass
+
+                # Probe offscreen renderer
+                probe = pyrender.OffscreenRenderer(16, 16)
+                probe.delete()
+                self.use_pyrender = True
+                log.info("3D Backend: Hardware OpenGL (pyrender/EGL) active")
+            except Exception as e:
+                log.warning("Hardware OpenGL unavailable (%s) — using high-performance Software 3D renderer", e)
+                self.use_pyrender = False
+        else:
+            log.info("PyRender not installed — using high-performance Software 3D renderer")
+
         self._init_materials()
         self._prebuild_component_meshes()
 
     def _init_materials(self):
-        # Forest green solder mask
-        self.sub_mat = pyrender.MetallicRoughnessMaterial(
-            baseColorFactor=[0.08, 0.33, 0.15, 1.0], roughnessFactor=0.35, metallicFactor=0.05
-        )
-        # Bright shiny silver metal for pins, leads, electrolytic can
-        self.silver_mat = pyrender.MetallicRoughnessMaterial(
-            baseColorFactor=[0.88, 0.88, 0.90, 1.0], roughnessFactor=0.15, metallicFactor=0.92
-        )
-        # Molded black plastic/epoxy for IC body, header body
-        self.ic_mat = pyrender.MetallicRoughnessMaterial(
-            baseColorFactor=[0.11, 0.11, 0.11, 1.0], roughnessFactor=0.55, metallicFactor=0.08
-        )
-        # Tan/brown ceramic for ceramic capacitors
-        self.cap_mat = pyrender.MetallicRoughnessMaterial(
-            baseColorFactor=[0.65, 0.45, 0.25, 1.0], roughnessFactor=0.45, metallicFactor=0.05
-        )
-        # Charcoal body for chip resistors
-        self.res_mat = pyrender.MetallicRoughnessMaterial(
-            baseColorFactor=[0.12, 0.12, 0.12, 1.0], roughnessFactor=0.42, metallicFactor=0.08
-        )
-        # Gold/copper plated pads and vias
-        self.copper_mat = pyrender.MetallicRoughnessMaterial(
-            baseColorFactor=[0.88, 0.68, 0.24, 1.0], roughnessFactor=0.22, metallicFactor=0.85
-        )
-        # Soft ground contact shadow
-        self.shadow_mat = pyrender.MetallicRoughnessMaterial(
-            baseColorFactor=[0.72, 0.72, 0.72, 0.45], roughnessFactor=1.0
-        )
-        # Industrial terminal block blue
-        self.terminal_mat = pyrender.MetallicRoughnessMaterial(
-            baseColorFactor=[0.12, 0.40, 0.72, 1.0], roughnessFactor=0.4, metallicFactor=0.1
-        )
-        # LED lens colors
-        self.led_orange_mat = pyrender.MetallicRoughnessMaterial(
-            baseColorFactor=[0.95, 0.55, 0.10, 1.0], roughnessFactor=0.25, metallicFactor=0.2
-        )
-        self.led_blue_mat = pyrender.MetallicRoughnessMaterial(
-            baseColorFactor=[0.20, 0.55, 0.95, 1.0], roughnessFactor=0.25, metallicFactor=0.2
-        )
-        self.led_green_mat = pyrender.MetallicRoughnessMaterial(
-            baseColorFactor=[0.15, 0.85, 0.25, 1.0], roughnessFactor=0.25, metallicFactor=0.2
-        )
+        # Base RGB colors
+        self.color_map = {
+            "substrate": (28, 110, 52),
+            "silver": (225, 225, 230),
+            "ic": (28, 28, 28),
+            "cap": (165, 115, 65),
+            "res": (32, 32, 32),
+            "copper": (225, 175, 60),
+            "shadow": (230, 230, 234),
+            "terminal": (30, 102, 184),
+            "led_orange": (245, 140, 25),
+            "led_blue": (50, 140, 245),
+            "led_green": (40, 215, 65),
+        }
+
+        if HAS_PYRENDER:
+            self.sub_mat = pyrender.MetallicRoughnessMaterial(
+                baseColorFactor=[0.08, 0.33, 0.15, 1.0], roughnessFactor=0.35, metallicFactor=0.05
+            )
+            self.silver_mat = pyrender.MetallicRoughnessMaterial(
+                baseColorFactor=[0.88, 0.88, 0.90, 1.0], roughnessFactor=0.15, metallicFactor=0.92
+            )
+            self.ic_mat = pyrender.MetallicRoughnessMaterial(
+                baseColorFactor=[0.11, 0.11, 0.11, 1.0], roughnessFactor=0.55, metallicFactor=0.08
+            )
+            self.cap_mat = pyrender.MetallicRoughnessMaterial(
+                baseColorFactor=[0.65, 0.45, 0.25, 1.0], roughnessFactor=0.45, metallicFactor=0.05
+            )
+            self.res_mat = pyrender.MetallicRoughnessMaterial(
+                baseColorFactor=[0.12, 0.12, 0.12, 1.0], roughnessFactor=0.42, metallicFactor=0.08
+            )
+            self.copper_mat = pyrender.MetallicRoughnessMaterial(
+                baseColorFactor=[0.88, 0.68, 0.24, 1.0], roughnessFactor=0.22, metallicFactor=0.85
+            )
+            self.shadow_mat = pyrender.MetallicRoughnessMaterial(
+                baseColorFactor=[0.72, 0.72, 0.72, 0.45], roughnessFactor=1.0
+            )
+            self.terminal_mat = pyrender.MetallicRoughnessMaterial(
+                baseColorFactor=[0.12, 0.40, 0.72, 1.0], roughnessFactor=0.4, metallicFactor=0.1
+            )
+            self.led_orange_mat = pyrender.MetallicRoughnessMaterial(
+                baseColorFactor=[0.95, 0.55, 0.10, 1.0], roughnessFactor=0.25, metallicFactor=0.2
+            )
+            self.led_blue_mat = pyrender.MetallicRoughnessMaterial(
+                baseColorFactor=[0.20, 0.55, 0.95, 1.0], roughnessFactor=0.25, metallicFactor=0.2
+            )
+            self.led_green_mat = pyrender.MetallicRoughnessMaterial(
+                baseColorFactor=[0.15, 0.85, 0.25, 1.0], roughnessFactor=0.25, metallicFactor=0.2
+            )
+        else:
+            self.sub_mat = "substrate"
+            self.silver_mat = "silver"
+            self.ic_mat = "ic"
+            self.cap_mat = "cap"
+            self.res_mat = "res"
+            self.copper_mat = "copper"
+            self.shadow_mat = "shadow"
+            self.terminal_mat = "terminal"
+            self.led_orange_mat = "led_orange"
+            self.led_blue_mat = "led_blue"
+            self.led_green_mat = "led_green"
 
     def _prebuild_component_meshes(self):
         """Construct detailed 3D geometric models for each component."""
@@ -503,72 +549,75 @@ class Renderer3D:
                 body = trimesh.creation.box(extents=[body_sz, body_sz, 1.2])
                 body.apply_translation([0, 0, 0.6])
                 parts.append((body, self.ic_mat))
-                # Gull-wing silver pins around perimeter
-                for p in np.linspace(-body_sz * 0.38, body_sz * 0.38, 7):
-                    for side in [-1, 1]:
-                        pin = trimesh.creation.box(extents=[0.9, 0.35, 0.25])
-                        pin.apply_translation([side * (body_sz / 2.0 + 0.45), p, 0.15])
-                        parts.append((pin, self.silver_mat))
-                    for side in [-1, 1]:
-                        pin = trimesh.creation.box(extents=[0.35, 0.9, 0.25])
-                        pin.apply_translation([p, side * (body_sz / 2.0 + 0.45), 0.15])
-                        parts.append((pin, self.silver_mat))
+                # Silver pins/leads along all 4 sides
+                for side in range(4):
+                    for p in np.linspace(-body_sz * 0.38, body_sz * 0.38, 7):
+                        lead = trimesh.creation.box(extents=[0.35, 1.4, 0.15])
+                        lead.apply_translation([0, 0, 0.1])
+                        if side == 0:
+                            lead.apply_translation([p, body_sz / 2.0 + 0.6, 0])
+                        elif side == 1:
+                            lead.apply_translation([p, -body_sz / 2.0 - 0.6, 0])
+                        elif side == 2:
+                            rot = trimesh.transformations.rotation_matrix(np.pi / 2, [0, 0, 1])
+                            lead.apply_transform(rot)
+                            lead.apply_translation([body_sz / 2.0 + 0.6, p, 0])
+                        elif side == 3:
+                            rot = trimesh.transformations.rotation_matrix(np.pi / 2, [0, 0, 1])
+                            lead.apply_transform(rot)
+                            lead.apply_translation([-body_sz / 2.0 - 0.6, p, 0])
+                        parts.append((lead, self.silver_mat))
 
-            elif ref.startswith("P") and len(fp.get("pads", [])) > 4:
-                # Pin Header Strip: black plastic base + protruding silver square pins
-                n_pins = len(fp.get("pads", []))
-                strip_len = max(2.54 * n_pins, 5.0)
-                strip_w = 2.5
-                base = trimesh.creation.box(extents=[strip_len, strip_w, 2.5])
-                base.apply_translation([0, 0, 1.25])
-                parts.append((base, self.ic_mat))
-                # Pins
-                for pin_idx in range(n_pins):
-                    px = -strip_len / 2.0 + 1.27 + pin_idx * 2.54
-                    pin = trimesh.creation.box(extents=[0.64, 0.64, 5.5])
-                    pin.apply_translation([px, 0, 2.75])
-                    parts.append((pin, self.silver_mat))
-
-            elif ref.startswith("P"):
-                # Terminal Block / Connector: colored housing + silver contacts
-                n_pads = max(len(fp.get("pads", [])), 2)
-                block_len = max(3.5 * n_pads, 6.0)
-                block = trimesh.creation.box(extents=[block_len, 6.5, 7.5])
-                block.apply_translation([0, 0, 3.75])
-                parts.append((block, self.terminal_mat))
-                # Screws on top
-                for p_idx in range(n_pads):
-                    sx = -block_len / 2.0 + 1.75 + p_idx * 3.5
-                    screw = trimesh.creation.cylinder(radius=1.2, height=0.3)
-                    screw.apply_translation([sx, 0, 7.5 + 0.15])
+            elif ref.startswith("P") and any(k in val for k in ["screw", "terminal", "blue", "conn_01x02", "conn_01x03"]):
+                # Terminal Block (Screw connector): Blue block + silver top screw cylinders
+                n_term = 3 if "03" in val else 2
+                tb_w = 5.08 * n_term
+                tb_d = 7.5
+                tb_h = 10.0
+                body = trimesh.creation.box(extents=[tb_w, tb_d, tb_h])
+                body.apply_translation([0, 0, tb_h / 2.0])
+                parts.append((body, self.terminal_mat))
+                # Screw cylinder indentations
+                for pin_i in range(n_term):
+                    off_x = (pin_i - (n_term - 1) / 2.0) * 5.08
+                    screw = trimesh.creation.cylinder(radius=1.3, height=0.4)
+                    screw.apply_translation([off_x, 0, tb_h + 0.05])
                     parts.append((screw, self.silver_mat))
 
-            elif ref.startswith("L"):
-                # Power Inductor: charcoal ferrite body + silver side tabs
-                ind = trimesh.creation.box(extents=[5.5, 5.5, 3.5])
-                ind.apply_translation([0, 0, 1.75])
-                parts.append((ind, self.ic_mat))
-                for side in [-1, 1]:
-                    tab = trimesh.creation.box(extents=[0.6, 5.2, 0.8])
-                    tab.apply_translation([side * 2.75, 0, 0.4])
-                    parts.append((tab, self.silver_mat))
+            elif ref.startswith("P"):
+                # Pin Header: Black base plastic strip + tall silver vertical pins
+                n_pins = 8 if ref in ["P1", "P2", "P3", "P4"] else 6
+                strip_len = n_pins * 2.54
+                base = trimesh.creation.box(extents=[strip_len, 2.4, 2.5])
+                base.apply_translation([0, 0, 1.25])
+                parts.append((base, self.ic_mat))
+                for pin_i in range(n_pins):
+                    off_x = (pin_i - (n_pins - 1) / 2.0) * 2.54
+                    pin = trimesh.creation.box(extents=[0.64, 0.64, 8.5])
+                    pin.apply_translation([off_x, 0, 4.25])
+                    parts.append((pin, self.silver_mat))
 
             elif ref.startswith("D"):
-                # LED / Diode: colored lens + silver end terminals
-                led_mat = self.led_orange_mat if "orange" in val else (self.led_green_mat if "green" in val else self.led_blue_mat)
-                body = trimesh.creation.box(extents=[1.2, 1.0, 0.7])
-                body.apply_translation([0, 0, 0.35])
-                parts.append((body, led_mat))
-                for side in [-1, 1]:
-                    term = trimesh.creation.box(extents=[0.4, 1.0, 0.7])
-                    term.apply_translation([side * 0.8, 0, 0.35])
+                # Diode / LED: Colored package
+                lens_color = self.led_orange_mat if ref == "D1" else (self.led_blue_mat if ref == "D2" else self.led_green_mat)
+                body = trimesh.creation.box(extents=[2.0, 1.2, 1.0])
+                body.apply_translation([0, 0, 0.5])
+                parts.append((body, lens_color))
+                for end in [-0.85, 0.85]:
+                    term = trimesh.creation.box(extents=[0.4, 1.2, 1.0])
+                    term.apply_translation([end, 0, 0.5])
                     parts.append((term, self.silver_mat))
 
+            elif ref.startswith("L"):
+                # Inductor: Charcoal/dark gray wirewound body
+                body = trimesh.creation.box(extents=[4.5, 4.5, 3.2])
+                body.apply_translation([0, 0, 1.6])
+                parts.append((body, self.res_mat))
+
             else:
-                # Chip Passive (Resistor / Capacitor)
-                is_cap = ref.startswith("C")
-                m_color = self.cap_mat if is_cap else self.res_mat
-                chip_l, chip_w, chip_h = 2.0, 1.25, 0.8
+                # Chip Resistor (0805/0603) or Ceramic Cap (0805)
+                chip_l, chip_w, chip_h = (2.0, 1.2, 0.8) if ref.startswith("R") else (2.0, 1.25, 0.9)
+                m_color = self.res_mat if ref.startswith("R") else self.cap_mat
                 body = trimesh.creation.box(extents=[chip_l * 0.55, chip_w, chip_h])
                 body.apply_translation([0, 0, chip_h / 2.0])
                 parts.append((body, m_color))
@@ -579,16 +628,14 @@ class Renderer3D:
 
             self.comp_models.append(parts)
 
-    def get_camera_pose(self, zoom_progress: float) -> tuple[np.ndarray, pyrender.PerspectiveCamera]:
+    def get_camera_pose(self, zoom_progress: float):
         """Compute camera pose with smooth easing from wide staging view to tight board view."""
-        cam = pyrender.PerspectiveCamera(yfov=np.radians(36))
-
         # Wide view: offset slightly towards staging margins
         dist_wide = max(self.bw, self.bh) * 2.75
         target_wide = np.array([14.0, -5.0, 0.0])
 
         # Tight view: centered directly on PCB
-        dist_tight = max(self.bw, self.bh) * 1.95
+        dist_tight = max(self.bw, self.bh) * 2.05
         target_tight = np.array([0.0, 0.0, 0.0])
 
         ease = 0.5 - 0.5 * math.cos(math.pi * zoom_progress)
@@ -615,16 +662,17 @@ class Renderer3D:
         cam_pose[:3, 2] = -forward
         cam_pose[:3, 3] = cam_pos
 
+        cam = pyrender.PerspectiveCamera(yfov=np.radians(36)) if HAS_PYRENDER else None
         return cam_pose, cam
 
-    def render_frame(
+    def _render_pyrender(
         self,
         placed_indices: set[int],
         interpolating: dict[int, tuple[float, float, float]] | None = None,
         zoom_progress: float = 0.0,
         routed_fraction: float = 0.0,
     ) -> Image.Image:
-        """Render a single 3D view frame using pyrender."""
+        """Render frame using hardware OpenGL / pyrender."""
         scene = pyrender.Scene(bg_color=[1.0, 1.0, 1.0, 1.0], ambient_light=[0.50, 0.50, 0.50])
 
         # 1. PCB Substrate
@@ -653,7 +701,7 @@ class Renderer3D:
             segments = self.design.get("segments", [])
             n_show_segs = int(len(segments) * min(routed_fraction, 1.0))
             for seg in segments[:n_show_segs]:
-                if "F.Cu" in seg["layer"]:
+                if "F.Cu" in seg.get("layer", ""):
                     sx, sy = seg["start"]
                     ex, ey = seg["end"]
                     rx1, ry1 = sx - self.center_x, -(sy - self.center_y)
@@ -667,7 +715,6 @@ class Renderer3D:
                         trace.apply_translation([(rx1 + rx2) / 2.0, (ry1 + ry2) / 2.0, self.pcb_th + 0.025])
                         scene.add(pyrender.Mesh.from_trimesh(trace, material=self.copper_mat))
 
-            # Vias in 3D
             vias = self.design.get("vias", [])
             n_show_vias = int(len(vias) * min(routed_fraction, 1.0))
             for via in vias[:n_show_vias]:
@@ -709,7 +756,6 @@ class Renderer3D:
         cam_pose, cam = self.get_camera_pose(zoom_progress)
         scene.add(cam, pose=cam_pose)
 
-        # Key light & fill light
         light1 = pyrender.DirectionalLight(color=[1.0, 0.98, 0.95], intensity=3.2)
         scene.add(light1, pose=cam_pose)
         light2 = pyrender.DirectionalLight(color=[0.90, 0.95, 1.0], intensity=1.8)
@@ -717,12 +763,201 @@ class Renderer3D:
         light2_pose[:3, 3] = [-cam_pose[0, 3], -cam_pose[1, 3], cam_pose[2, 3] * 0.8]
         scene.add(light2, pose=light2_pose)
 
-        # Offscreen render
         renderer = pyrender.OffscreenRenderer(self.size, self.size)
         color, _ = renderer.render(scene)
         renderer.delete()
 
         return Image.fromarray(color)
+
+    def _render_software(
+        self,
+        placed_indices: set[int],
+        interpolating: dict[int, tuple[float, float, float]] | None = None,
+        zoom_progress: float = 0.0,
+        routed_fraction: float = 0.0,
+    ) -> Image.Image:
+        """High-performance Software 3D renderer with shading and depth sorting (zero external GL dependencies)."""
+        img = Image.new("RGB", (self.size, self.size), (255, 255, 255))
+        draw = ImageDraw.Draw(img)
+
+        # Camera math matching get_camera_pose
+        ease = 0.5 - 0.5 * math.cos(math.pi * zoom_progress)
+        dist_wide = max(self.bw, self.bh) * 2.75
+        target_wide = np.array([14.0, -5.0, 0.0])
+        dist_tight = max(self.bw, self.bh) * 2.05
+        target_tight = np.array([0.0, 0.0, 0.0])
+
+        cam_dist = dist_wide + (dist_tight - dist_wide) * ease
+        target = target_wide + (target_tight - target_wide) * ease
+
+        elev = np.radians(36)
+        azim = np.radians(45)
+        cam_x = target[0] + cam_dist * np.cos(elev) * np.sin(azim)
+        cam_y = target[1] - cam_dist * np.cos(elev) * np.cos(azim)
+        cam_z = target[2] + cam_dist * np.sin(elev)
+        cam_pos = np.array([cam_x, cam_y, cam_z])
+
+        forward = target - cam_pos
+        forward /= np.linalg.norm(forward)
+        up = np.array([0.0, 0.0, 1.0])
+        right = np.cross(forward, up)
+        right /= np.linalg.norm(right)
+        up_cam = np.cross(right, forward)
+
+        fov = np.radians(36)
+        f_len = 0.5 * self.size / np.tan(fov / 2.0)
+        cx_scr, cy_scr = self.size / 2.0, self.size / 2.0
+
+        def project_pts(pts_world):
+            rel_v = pts_world - cam_pos
+            xc = rel_v @ right
+            yc = rel_v @ up_cam
+            zc = rel_v @ forward
+            zc_clamped = np.maximum(zc, 1e-3)
+            u = cx_scr + f_len * (xc / zc_clamped)
+            v = cy_scr - f_len * (yc / zc_clamped)
+            return np.column_stack([u, v]), zc
+
+        L = np.array([0.4, -0.6, 0.8])
+        L = L / np.linalg.norm(L)
+
+        # 1. Contact shadow on floor at z = 0
+        sh_w, sh_h = self.bw + 8.0, self.bh + 8.0
+        sh_corners = np.array([
+            [-sh_w / 2.0, -sh_h / 2.0, 0.0],
+            [ sh_w / 2.0, -sh_h / 2.0, 0.0],
+            [ sh_w / 2.0,  sh_h / 2.0, 0.0],
+            [-sh_w / 2.0,  sh_h / 2.0, 0.0],
+        ])
+        poly_sh, _ = project_pts(sh_corners)
+        draw.polygon([tuple(p) for p in poly_sh], fill=(230, 230, 234))
+
+        # 2. PCB Substrate
+        pcb_mesh = trimesh.creation.box(extents=[self.bw, self.bh, self.pcb_th])
+        pcb_mesh.apply_translation([0, 0, self.pcb_th / 2.0])
+        v_w = pcb_mesh.vertices
+        uv, zc = project_pts(v_w)
+        for f_i, face in enumerate(pcb_mesh.faces):
+            norm = pcb_mesh.face_normals[f_i]
+            v0 = v_w[face[0]]
+            if np.dot(norm, cam_pos - v0) <= 0.0:
+                continue
+            dot = max(0.0, float(np.dot(norm, L)))
+            shade = 0.45 + 0.55 * dot
+            rgb = tuple(int(min(255, c * shade)) for c in self.color_map["substrate"])
+            draw.polygon([tuple(uv[idx]) for idx in face], fill=rgb)
+
+        # 3. Corner mounting holes
+        for hx, hy in [
+            (-self.bw / 2 + 3.5, -self.bh / 2 + 3.5),
+            (self.bw / 2 - 3.5, -self.bh / 2 + 3.5),
+            (-self.bw / 2 + 3.5, self.bh / 2 - 3.5),
+            (self.bw / 2 - 3.5, self.bh / 2 - 3.5),
+        ]:
+            pts_hole = np.array([
+                [hx + 1.8 * np.cos(t), hy + 1.8 * np.sin(t), self.pcb_th + 0.01]
+                for t in np.linspace(0, 2 * np.pi, 16)
+            ])
+            proj_hole, _ = project_pts(pts_hole)
+            draw.polygon([tuple(p) for p in proj_hole], fill=self.color_map["copper"])
+            pts_inner = np.array([
+                [hx + 1.0 * np.cos(t), hy + 1.0 * np.sin(t), self.pcb_th + 0.02]
+                for t in np.linspace(0, 2 * np.pi, 16)
+            ])
+            proj_inner, _ = project_pts(pts_inner)
+            draw.polygon([tuple(p) for p in proj_inner], fill=(20, 20, 20))
+
+        # 4. Routed copper traces & vias in 3D
+        if routed_fraction > 0.0:
+            segments = self.design.get("segments", [])
+            n_show_segs = int(len(segments) * min(routed_fraction, 1.0))
+            for seg in segments[:n_show_segs]:
+                if "F.Cu" in seg.get("layer", ""):
+                    sx, sy = seg["start"]
+                    ex, ey = seg["end"]
+                    p1 = np.array([sx - self.center_x, -(sy - self.center_y), self.pcb_th + 0.015])
+                    p2 = np.array([ex - self.center_x, -(ey - self.center_y), self.pcb_th + 0.015])
+                    pts_proj, _ = project_pts(np.array([p1, p2]))
+                    draw.line([tuple(pts_proj[0]), tuple(pts_proj[1])], fill=self.color_map["copper"], width=2)
+
+            vias = self.design.get("vias", [])
+            n_show_vias = int(len(vias) * min(routed_fraction, 1.0))
+            for via in vias[:n_show_vias]:
+                vx, vy = via["pos"]
+                vp = np.array([vx - self.center_x, -(vy - self.center_y), self.pcb_th + 0.02])
+                v_proj, _ = project_pts(np.array([vp]))
+                px, py = v_proj[0]
+                draw.ellipse([px - 2, py - 2, px + 2, py + 2], fill=self.color_map["copper"], outline=(40, 30, 15))
+
+        # 5. Component meshes (sorted back-to-front by depth)
+        comp_faces = []
+        for i, comp in enumerate(self.design["components"]):
+            is_placed = i in placed_indices
+            is_interp = interpolating and i in interpolating
+
+            if is_interp:
+                cx, cy, cz = interpolating[i]
+            elif is_placed:
+                pos = self.design["placement"]["positions"][i]
+                if pos is not None:
+                    cx, cy = pos["position"]
+                    cz = self.pcb_th
+                else:
+                    cx, cy = self.unplaced_slots[i]
+                    cz = 0.0
+            else:
+                cx, cy = self.unplaced_slots[i]
+                cz = 0.0
+
+            rel_x = cx - self.center_x
+            rel_y = -(cy - self.center_y)
+
+            parts = self.comp_models[i]
+            for mesh_def, mat_spec in parts:
+                if isinstance(mat_spec, str):
+                    base_rgb = self.color_map.get(mat_spec, (180, 180, 180))
+                else:
+                    c_fac = getattr(mat_spec, "baseColorFactor", [0.7, 0.7, 0.7])
+                    base_rgb = tuple(int(min(255, c * 255)) for c in c_fac[:3])
+
+                v_w = mesh_def.vertices + [rel_x, rel_y, cz]
+                uv, zc = project_pts(v_w)
+                normals = mesh_def.face_normals
+
+                for f_i, face in enumerate(mesh_def.faces):
+                    norm = normals[f_i]
+                    v0 = v_w[face[0]]
+                    if np.dot(norm, cam_pos - v0) <= 0.0:
+                        continue
+                    depth = float(zc[face].mean())
+                    dot = max(0.0, float(np.dot(norm, L)))
+                    shade = 0.45 + 0.55 * dot
+                    rgb = tuple(int(min(255, c * shade)) for c in base_rgb)
+                    poly = [tuple(uv[idx]) for idx in face]
+                    comp_faces.append((depth, poly, rgb))
+
+        comp_faces.sort(key=lambda x: x[0], reverse=True)
+        for _, poly, rgb in comp_faces:
+            draw.polygon(poly, fill=rgb)
+
+        return img
+
+    def render_frame(
+        self,
+        placed_indices: set[int],
+        interpolating: dict[int, tuple[float, float, float]] | None = None,
+        zoom_progress: float = 0.0,
+        routed_fraction: float = 0.0,
+    ) -> Image.Image:
+        """Render a single 3D view frame, using hardware OpenGL or falling back to software 3D."""
+        if self.use_pyrender:
+            try:
+                return self._render_pyrender(placed_indices, interpolating, zoom_progress, routed_fraction)
+            except Exception as e:
+                log.warning("pyrender frame failed (%s) — switching to software 3D renderer", e)
+                self.use_pyrender = False
+                return self._render_software(placed_indices, interpolating, zoom_progress, routed_fraction)
+        return self._render_software(placed_indices, interpolating, zoom_progress, routed_fraction)
 
 
 # ---------------------------------------------------------------------------
@@ -751,7 +986,7 @@ def render_rollout_video(
 
     log.info("Initializing 2D and 3D renderers (640×640 each) …")
     renderer_2d = Renderer2D(design, unplaced_slots, size=640)
-    renderer_3d = Renderer3D(design, unplaced_slots, size=640) if HAS_PYRENDER else None
+    renderer_3d = Renderer3D(design, unplaced_slots, size=640)
 
     # Total frames: 15.0s at 30 fps = 450 frames
     total_frames = int(fps * duration)
@@ -832,15 +1067,12 @@ def render_rollout_video(
         )
 
         # Render 3D panel
-        if renderer_3d:
-            img_3d = renderer_3d.render_frame(
-                placed_indices,
-                interpolating=interp_3d,
-                zoom_progress=zoom_prog,
-                routed_fraction=routed_frac,
-            )
-        else:
-            img_3d = Image.new("RGB", (640, 640), (240, 240, 240))
+        img_3d = renderer_3d.render_frame(
+            placed_indices,
+            interpolating=interp_3d,
+            zoom_progress=zoom_prog,
+            routed_fraction=routed_frac,
+        )
 
         # Compose side-by-side (1280x640)
         combined = Image.new("RGB", (1280, 640), (255, 255, 255))
