@@ -133,3 +133,20 @@ def test_forward_empty_context_gradient_flow():
     assert z_star.grad is not None
     assert torch.isfinite(z_star.grad).all()
 
+
+def test_load_legacy_state_dict_with_empty_context():
+    """Verify that legacy checkpoints containing single 'empty_context' can be loaded cleanly."""
+    pol = SCPTPolicy(d=32, pair_dim=14, n_heads=2, n_layers=1)
+    sd = pol.state_dict()
+    # Simulate legacy state dict by removing empty_context_k/v and inserting empty_context
+    del sd["empty_context_k"]
+    del sd["empty_context_v"]
+    legacy_tensor = torch.ones(32) * 0.42
+    sd["empty_context"] = legacy_tensor
+
+    # Should load without raising RuntimeError
+    pol.load_state_dict(sd)
+    assert torch.allclose(pol.empty_context_k, legacy_tensor)
+    assert torch.allclose(pol.empty_context_v, legacy_tensor)
+
+

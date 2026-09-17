@@ -136,10 +136,22 @@ def load_checkpoint(
     dual_updater,
 ) -> int:
     """Load weights from a checkpoint. Returns the outer_iter it was saved at."""
-    ckpt = torch.load(path, map_location="cpu", weights_only=True)
-    if "encoder_state" in ckpt:
+    try:
+        ckpt = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception:
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+
+    if "encoder_state" in ckpt and encoder is not None:
         encoder.load_state_dict(ckpt["encoder_state"])
-    policy.load_state_dict(ckpt["policy_state"])
+
+    policy_state = ckpt["policy_state"]
+    if "empty_context" in policy_state and "empty_context_k" not in policy_state:
+        old_ec = policy_state.pop("empty_context")
+        policy_state["empty_context_k"] = old_ec.clone()
+        policy_state["empty_context_v"] = old_ec.clone()
+        logger.info("Migrated legacy 'empty_context' to ('empty_context_k', 'empty_context_v')")
+
+    policy.load_state_dict(policy_state)
     value_heads.load_state_dict(ckpt["value_heads_state"])
     for k, v in ckpt.get("lambdas", {}).items():
         dual_updater._lambdas[k] = v

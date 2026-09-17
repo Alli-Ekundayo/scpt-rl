@@ -303,6 +303,182 @@ impl GridBasedRouter {
                 + r.routed_num_vias() as f64 * self.params.via_insertion_cost
         }).sum()
     }
+
+    /// Extract the routed solution (segments, vias, statistics) in real-world mm coordinates.
+    pub fn extract_routing_solution(&self, db: &KicadPcbDatabase) -> RoutingSolution {
+        let solution = if !self.best_solution.is_empty() {
+            &self.best_solution
+        } else {
+            &self.grid_nets
+        };
+
+        let s = self.params.input_scale as f64;
+        let mut segments = Vec::new();
+        let mut vias = Vec::new();
+        let mut total_wl = 0.0;
+        let mut total_vias = 0;
+        let mut total_bends = 0;
+        let mut routed_nets = 0;
+        let total_nets = solution.len();
+
+        let net_info_map: HashMap<i32, (&str, &str)> = db
+            .nets
+            .iter()
+            .map(|n| (n.id, (n.name.as_str(), n.netclass_name.as_str())))
+            .collect();
+
+        let netclass_map: HashMap<&str, &crate::kicad_parser::types::Netclass> = db
+            .netclasses
+            .iter()
+            .map(|nc| (nc.name.as_str(), nc))
+            .collect();
+
+        for route in solution {
+            let (net_name, netclass_name) = net_info_map
+                .get(&route.net_id)
+                .copied()
+                .unwrap_or(("", ""));
+            let nc_opt = netclass_map.get(netclass_name);
+            let trace_width = nc_opt.map(|nc| nc.trace_width).unwrap_or(0.25);
+            let via_dia = nc_opt.map(|nc| nc.via_dia).unwrap_or(0.8);
+            let via_drill = nc_opt.map(|nc| nc.via_drill).unwrap_or(0.4);
+
+            let mut net_has_routes = false;
+            let mut paths_with_length = 0;
+
+            for path in &route.grid_paths {
+                if path.segments.is_empty() {
+                    continue;
+                }
+                net_has_routes = true;
+                let mut gp = path.clone();
+                gp.remove_redundant_points();
+
+                total_bends += gp.routed_num_bends();
+
+                if gp.segments.len() >= 2 {
+                    paths_with_length += 1;
+                }
+
+                for i in 0..gp.segments.len().saturating_sub(1) {
+                    let cur = gp.segments[i];
+                    let next = gp.segments[i + 1];
+
+                    let x1 = (cur.x as f64) / s + self.min_x;
+                    let y1 = (cur.y as f64) / s + self.min_y;
+                    let x2 = (next.x as f64) / s + self.min_x;
+                    let y2 = (next.y as f64) / s + self.min_y;
+
+                    if cur.z == next.z {
+                        // Copper trace segment
+                        let dist = ((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt();
+                        if dist > 1e-6 {
+                            total_wl += dist;
+                            let layer_name = self
+                                .grid_layer_to_name
+                                .get(cur.z as usize)
+                                .cloned()
+                                .unwrap_or_else(|| format!("Layer_{}", cur.z));
+                            segments.push(RoutedSegment {
+                                start: [x1, y1],
+                                end: [x2, y2],
+                                width: trace_width,
+                                layer: layer_name,
+                                net: route.net_id,
+                                net_name: net_name.to_string(),
+                            });
+                        }
+                    } else {
+                        // Via transition
+                        total_vias += 1;
+                        let l1 = self
+                            .grid_layer_to_name
+                            .get(cur.z as usize)
+                            .cloned()
+                            .unwrap_or_else(|| "F.Cu".to_string());
+                        let l2 = self
+                            .grid_layer_to_name
+                            .get(next.z as usize)
+                            .cloned()
+                            .unwrap_or_else(|| "B.Cu".to_string());
+                        vias.push(RoutedVia {
+                            at: [x1, y1],
+                            size: via_dia,
+                            drill: via_drill,
+                            layers: [l1, l2],
+                            net: route.net_id,
+                            net_name: net_name.to_string(),
+                        });
+                    }
+                }
+            }
+
+            let required_paths = route.grid_pins.len().saturating_sub(1).max(1);
+            if net_has_routes && paths_with_length >= required_paths {
+                routed_nets += 1;
+            }
+        }
+
+        let completion_rate = if total_nets > 0 {
+            routed_nets as f64 / total_nets as f64
+        } else {
+            1.0
+        };
+
+        RoutingSolution {
+            segments,
+            vias,
+            stats: RoutingStats {
+                wirelength_mm: total_wl,
+                num_vias: total_vias,
+                num_bends: total_bends,
+                num_routed_nets: routed_nets,
+                total_nets,
+                completion_rate,
+            },
+        }
+    }
+}
+
+/// A 2D copper trace segment between two world points in mm.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RoutedSegment {
+    pub start: [f64; 2],
+    pub end: [f64; 2],
+    pub width: f64,
+    pub layer: String,
+    pub net: i32,
+    pub net_name: String,
+}
+
+/// A via connecting two layers at a world point in mm.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RoutedVia {
+    pub at: [f64; 2],
+    pub size: f64,
+    pub drill: f64,
+    pub layers: [String; 2],
+    pub net: i32,
+    pub net_name: String,
+}
+
+/// Aggregated statistics of the routed solution.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RoutingStats {
+    pub wirelength_mm: f64,
+    pub num_vias: i32,
+    pub num_bends: i32,
+    pub num_routed_nets: usize,
+    pub total_nets: usize,
+    pub completion_rate: f64,
+}
+
+/// Full routing solution serialized to JSON.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RoutingSolution {
+    pub segments: Vec<RoutedSegment>,
+    pub vias: Vec<RoutedVia>,
+    pub stats: RoutingStats,
 }
 
 /// Rasterise a filled circle of integer `radius` into relative (dx, dy) offsets.

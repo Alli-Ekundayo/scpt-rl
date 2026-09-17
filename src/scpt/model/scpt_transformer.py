@@ -80,6 +80,23 @@ class SCPTPolicy(nn.Module):
         self.empty_context_k = nn.Parameter(torch.randn(d) * 0.02)
         self.empty_context_v = nn.Parameter(torch.randn(d) * 0.02)
 
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ):
+        # Backward compatibility: legacy checkpoints have a single 'empty_context'
+        # parameter rather than distinct 'empty_context_k' and 'empty_context_v'.
+        old_key = prefix + "empty_context"
+        if old_key in state_dict:
+            old_val = state_dict.pop(old_key)
+            if (prefix + "empty_context_k") not in state_dict:
+                state_dict[prefix + "empty_context_k"] = old_val.clone()
+            if (prefix + "empty_context_v") not in state_dict:
+                state_dict[prefix + "empty_context_v"] = old_val.clone()
+
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
+
     def forward(self, z_star, Z_placed, F_pair, grid_xy, action_mask, kv_mask=None):
         """Compute logits over grid cells.
         

@@ -174,6 +174,39 @@ def _patch_footprint_at(
     return "\n".join(result), n_patched
 
 
+def _append_routes_to_pcb(pcb_text: str, segments: list[dict], vias: list[dict]) -> str:
+    """Append routed segments and vias as KiCad s-expressions before the final ')'."""
+    last_close = pcb_text.rfind(")")
+    if last_close == -1 or (not segments and not vias):
+        return pcb_text
+
+    s_exprs = []
+    for seg in segments:
+        x1, y1 = seg["start"]
+        x2, y2 = seg["end"]
+        w = seg["width"]
+        layer = seg["layer"]
+        net = seg["net"]
+        s_exprs.append(
+            f'  (segment (start {x1:.4f} {y1:.4f}) (end {x2:.4f} {y2:.4f}) '
+            f'(width {w:.4f}) (layer "{layer}") (net {net}))'
+        )
+
+    for v in vias:
+        x, y = v["at"]
+        size = v["size"]
+        drill = v["drill"]
+        l1, l2 = v["layers"]
+        net = v["net"]
+        s_exprs.append(
+            f'  (via (at {x:.4f} {y:.4f}) (size {size:.4f}) (drill {drill:.4f}) '
+            f'(layers "{l1}" "{l2}") (net {net}))'
+        )
+
+    block = "\n" + "\n".join(s_exprs) + "\n"
+    return pcb_text[:last_close] + block + pcb_text[last_close:]
+
+
 
 # ---------------------------------------------------------------------------
 # Policy rollout (optional — needs checkpoint)
@@ -213,7 +246,12 @@ def _run_policy_rollout(
     ).to(device)
     if "encoder_state" in ckpt and ckpt["encoder_state"] is not None:
         encoder.load_state_dict(ckpt["encoder_state"])
-    policy.load_state_dict(ckpt["policy_state"])
+    policy_state = ckpt["policy_state"]
+    if "empty_context" in policy_state and "empty_context_k" not in policy_state:
+        old_ec = policy_state.pop("empty_context")
+        policy_state["empty_context_k"] = old_ec.clone()
+        policy_state["empty_context_v"] = old_ec.clone()
+    policy.load_state_dict(policy_state)
     encoder.eval()
     policy.eval()
 
@@ -345,6 +383,18 @@ def main(argv: list[str] | None = None) -> None:
         "--grid-resolution-mm", type=float, default=0.5,
         help="Grid cell size in mm; must match training (default: 0.5)",
     )
+    parser.add_argument(
+        "--route", action="store_true",
+        help="Route the board using pcb_router and bake copper traces & vias",
+    )
+    parser.add_argument(
+        "--route-iterations", type=int, default=2,
+        help="Router rip-up reroute iterations (default: 2)",
+    )
+    parser.add_argument(
+        "--route-grid-scale", type=int, default=2,
+        help="Router grid scale factor (default: 2)",
+    )
     args = parser.parse_args(argv)
 
     board_path = args.board
@@ -406,6 +456,45 @@ def main(argv: list[str] | None = None) -> None:
             f.write(patched)
 
     log.info("Written → %s", out_path)
+
+    # ── 4. Route and bake copper tracks ──────────────────────────────────────
+    if args.route:
+        log.info("Executing pcb_router on placed board: %s", out_path)
+        try:
+            from scpt.rust_bridge.router_client import route
+
+            placed_design_json = pcb_parser.load_kicad_pcb(str(out_path))
+            routed_json = route(
+                placed_design_json,
+                num_iterations=args.route_iterations,
+                grid_scale=args.route_grid_scale,
+            )
+            routed_data = json.loads(routed_json)
+            routes = routed_data.get("routes", {})
+            segments = routes.get("segments", [])
+            vias = routes.get("vias", [])
+            stats = routes.get("stats", {})
+
+            with open(out_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            routed_pcb_text = _append_routes_to_pcb(content, segments, vias)
+
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(routed_pcb_text)
+
+            log.info(
+                "Successfully baked %d segments and %d vias into %s "
+                "(completion: %.1f%%, wirelength: %.1f mm)",
+                len(segments),
+                len(vias),
+                out_path,
+                stats.get("completion_rate", 0.0) * 100.0,
+                stats.get("wirelength_mm", 0.0),
+            )
+        except Exception as exc:
+            log.error("Routing failed: %s", exc)
+
     log.info(
         "Suggested next steps:\n"
         "  2D SVG :  kicad-cli pcb export svg --board-only %s -o /tmp/board_2d/\n"

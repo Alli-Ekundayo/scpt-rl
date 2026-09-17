@@ -37,8 +37,9 @@ impl GridPath {
             let prev = &window[0];
             let cur = &window[1];
             let next = &window[2];
-            // Mark collinear (same direction) middle point for removal
-            if cur.x - prev.x == next.x - cur.x
+            // Mark collinear (same direction) middle point for removal only if on the same layer
+            if cur.z == prev.z && next.z == cur.z
+                && cur.x - prev.x == next.x - cur.x
                 && cur.y - prev.y == next.y - cur.y
             {
                 keep[i + 1] = false;

@@ -83,39 +83,61 @@ def load_board_data(board_path: str | Path) -> dict[str, Any]:
     board_path = Path(board_path)
     design = json.loads(pcb_parser.load_kicad_pcb(str(board_path)))
 
-    # Raw text extraction for copper segments and vias
-    raw_text = board_path.read_text(encoding="utf-8", errors="ignore")
+    # Check if router-generated routes already exist in the design IR
+    if "routes" in design and (design["routes"].get("segments") or design["routes"].get("vias")):
+        segments = [
+            {
+                "start": (float(s["start"][0]), float(s["start"][1])),
+                "end": (float(s["end"][0]), float(s["end"][1])),
+                "width": float(s["width"]),
+                "layer": s["layer"],
+                "net": int(s["net"]),
+            }
+            for s in design["routes"].get("segments", [])
+        ]
+        vias = [
+            {
+                "pos": (float(v["at"][0]), float(v["at"][1])),
+                "size": float(v["size"]),
+                "drill": float(v["drill"]),
+                "net": int(v["net"]),
+            }
+            for v in design["routes"].get("vias", [])
+        ]
+    else:
+        # Raw text extraction for copper segments and vias
+        raw_text = board_path.read_text(encoding="utf-8", errors="ignore")
 
-    # Extract segments: (segment (start X Y) (end X Y) (width W) (layer L) (net N))
-    seg_pattern = re.compile(
-        r'\(segment\s+\(start\s+([\d\.-]+)\s+([\d\.-]+)\)\s+\(end\s+([\d\.-]+)\s+([\d\.-]+)\)'
-        r'\s+\(width\s+([\d\.-]+)\)\s+\(layer\s+\"?([^\s\"]+)\"?\)\s+\(net\s+(\d+)\)'
-    )
-    segments = []
-    for m in seg_pattern.finditer(raw_text):
-        x1, y1, x2, y2, w, layer, net = m.groups()
-        segments.append({
-            "start": (float(x1), float(y1)),
-            "end": (float(x2), float(y2)),
-            "width": float(w),
-            "layer": layer,
-            "net": int(net),
-        })
+        # Extract segments: (segment (start X Y) (end X Y) (width W) (layer L) (net N))
+        seg_pattern = re.compile(
+            r'\(segment\s+\(start\s+([\d\.-]+)\s+([\d\.-]+)\)\s+\(end\s+([\d\.-]+)\s+([\d\.-]+)\)'
+            r'\s+\(width\s+([\d\.-]+)\)\s+\(layer\s+\"?([^\s\"]+)\"?\)\s+\(net\s+(\d+)\)'
+        )
+        segments = []
+        for m in seg_pattern.finditer(raw_text):
+            x1, y1, x2, y2, w, layer, net = m.groups()
+            segments.append({
+                "start": (float(x1), float(y1)),
+                "end": (float(x2), float(y2)),
+                "width": float(w),
+                "layer": layer,
+                "net": int(net),
+            })
 
-    # Extract vias: (via (at X Y) (size S) (drill D) (layers L1 L2) (net N))
-    via_pattern = re.compile(
-        r'\(via\s+(?:\([^\)]+\)\s+)*\(at\s+([\d\.-]+)\s+([\d\.-]+)\)\s+\(size\s+([\d\.-]+)\)'
-        r'(?:\s+\(drill\s+([\d\.-]+)\))?(?:\s+\(layers\s+[^\)]+\))?\s+\(net\s+(\d+)\)'
-    )
-    vias = []
-    for m in via_pattern.finditer(raw_text):
-        vx, vy, sz, dr, net = m.groups()
-        vias.append({
-            "pos": (float(vx), float(vy)),
-            "size": float(sz),
-            "drill": float(dr) if dr else float(sz) * 0.5,
-            "net": int(net),
-        })
+        # Extract vias: (via (at X Y) (size S) (drill D) (layers L1 L2) (net N))
+        via_pattern = re.compile(
+            r'\(via\s+(?:\([^\)]+\)\s+)*\(at\s+([\d\.-]+)\s+([\d\.-]+)\)\s+\(size\s+([\d\.-]+)\)'
+            r'(?:\s+\(drill\s+([\d\.-]+)\))?(?:\s+\(layers\s+[^\)]+\))?\s+\(net\s+(\d+)\)'
+        )
+        vias = []
+        for m in via_pattern.finditer(raw_text):
+            vx, vy, sz, dr, net = m.groups()
+            vias.append({
+                "pos": (float(vx), float(vy)),
+                "size": float(sz),
+                "drill": float(dr) if dr else float(sz) * 0.5,
+                "net": int(net),
+            })
 
     design["segments"] = segments
     design["vias"] = vias

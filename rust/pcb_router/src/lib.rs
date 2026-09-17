@@ -54,10 +54,20 @@ fn route(
     }
     router.initialization(&db);
     router.route_all();
-    // v1: return the input design as-is. Routing results are on the router's
-    // internal state (best_solution) but not serialized back. A future pass
-    // will convert routed segments back into a SCPT-compatible JSON.
-    Ok(design_json.to_string())
+
+    let solution = router.extract_routing_solution(&db);
+
+    let mut val: serde_json::Value = serde_json::from_str(design_json)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("parse input design JSON: {e}")))?;
+
+    if let serde_json::Value::Object(ref mut map) = val {
+        let solution_val = serde_json::to_value(solution)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("serialize routes: {e}")))?;
+        map.insert("routes".to_string(), solution_val);
+    }
+
+    serde_json::to_string(&val)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("serialize output JSON: {e}")))
 }
 
 #[pymodule]

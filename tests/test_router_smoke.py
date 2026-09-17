@@ -34,3 +34,20 @@ def test_route_returns_valid_json():
 def test_route_invalid_json_raises():
     with pytest.raises(Exception):
         pcb_router.route("not valid json")
+
+
+def test_route_enriches_json_with_routes_and_stats():
+    design_json = pcb_parser.load_kicad_pcb(str(FIXTURE))
+    result = pcb_router.route(design_json, num_iterations=1, grid_scale=2)
+    parsed = json.loads(result)
+    assert "routes" in parsed
+    routes = parsed["routes"]
+    assert "segments" in routes
+    assert "vias" in routes
+    assert "stats" in routes
+    stats = routes["stats"]
+    assert "completion_rate" in stats
+    assert "wirelength_mm" in stats
+    assert "num_vias" in stats
+    assert stats["completion_rate"] >= 0.0
+

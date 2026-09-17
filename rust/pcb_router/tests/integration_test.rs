@@ -216,3 +216,25 @@ fn test_nan_priority_queue_handling() {
     let _fourth = q.pop().unwrap();
     assert!(q.is_empty());
 }
+
+#[test]
+fn test_extract_routing_solution_same_and_diff_layer() {
+    let pads = vec![
+        make_pad("U1", "1", (10.0, 10.0), 1, vec!["F.Cu"]),
+        make_pad("U1", "2", (15.0, 10.0), 1, vec!["B.Cu"]),
+    ];
+    let db = build_test_db(pads);
+
+    let mut router = GridBasedRouter::new(GlobalParam::default());
+    router.initialization(&db);
+    router.route_all();
+
+    let solution = router.extract_routing_solution(&db);
+    assert!(!solution.segments.is_empty(), "Should extract copper segments");
+    assert!(!solution.vias.is_empty(), "Should extract at least one via for cross-layer route");
+    assert!(solution.stats.wirelength_mm > 0.0, "Wirelength should be positive");
+    assert!(solution.stats.completion_rate > 0.0, "Completion rate should be positive");
+    assert_eq!(solution.stats.total_nets, 1);
+    assert_eq!(solution.stats.num_routed_nets, 1);
+}
+

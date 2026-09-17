@@ -90,7 +90,12 @@ def _build_and_load(ckpt_path: str, cfg: SimpleNamespace):
 
     if "encoder_state" in ckpt:
         encoder.load_state_dict(ckpt["encoder_state"])
-    policy.load_state_dict(ckpt["policy_state"])
+    policy_state = ckpt["policy_state"]
+    if "empty_context" in policy_state and "empty_context_k" not in policy_state:
+        old_ec = policy_state.pop("empty_context")
+        policy_state["empty_context_k"] = old_ec.clone()
+        policy_state["empty_context_v"] = old_ec.clone()
+    policy.load_state_dict(policy_state)
     value_heads.load_state_dict(ckpt["value_heads_state"])
 
     lambdas = ckpt.get("lambdas", {})
@@ -220,6 +225,9 @@ def main(argv: list[str] | None = None) -> dict:
     )
     parser.add_argument("--output", default=None, help="Write JSON results to this path")
     parser.add_argument("--n-episodes", type=int, default=1, help="Episodes per board")
+    parser.add_argument("--route", action="store_true", help="Evaluate post-placement routability with pcb_router")
+    parser.add_argument("--route-iterations", type=int, default=2, help="Router rip-up iterations (default: 2)")
+    parser.add_argument("--route-grid-scale", type=int, default=2, help="Router grid resolution scale (default: 2)")
     args = parser.parse_args(argv)
 
     cfg = _load_cfg(args.config)
@@ -268,12 +276,40 @@ def main(argv: list[str] | None = None) -> dict:
                             ep["reward"], ep["steps"],
                             "" if ep["terminated_normally"] else " [INFEASIBLE]",
                         )
-                    board_results.append({
+                    board_entry = {
                         "board": board_path,
                         "mean_reward": sum(board_ep_rewards) / len(board_ep_rewards),
                         "n_episodes": len(board_ep_rewards),
                         "mean_costs": {k: sum(v) / len(v) for k, v in board_ep_costs.items()},
-                    })
+                    }
+                    if args.route:
+                        import time
+                        try:
+                            from scpt.rust_bridge.router_client import route
+                            design_json = json.dumps(env.current_design())
+                            t_route_0 = time.perf_counter()
+                            routed_json = route(
+                                design_json,
+                                num_iterations=args.route_iterations,
+                                grid_scale=args.route_grid_scale,
+                            )
+                            t_route = time.perf_counter() - t_route_0
+                            routed_data = json.loads(routed_json)
+                            r_stats = routed_data.get("routes", {}).get("stats", {})
+                            r_stats["route_time_s"] = round(t_route, 3)
+                            board_entry["routing_stats"] = r_stats
+                            logger.info(
+                                "  %s routed: completion=%.1f%% wirelength=%.1fmm vias=%d time=%.2fs",
+                                Path(board_path).name,
+                                r_stats.get("completion_rate", 0.0) * 100.0,
+                                r_stats.get("wirelength_mm", 0.0),
+                                r_stats.get("num_vias", 0),
+                                t_route,
+                            )
+                        except Exception as route_err:
+                            logger.warning("Routing failed for %s: %s", board_path, route_err)
+                            board_entry["routing_error"] = str(route_err)
+                    board_results.append(board_entry)
                 except Exception as e:
                     logger.warning("Failed to evaluate %s: %s", board_path, e)
                     board_results.append({"board": board_path, "error": str(e)})
@@ -322,6 +358,18 @@ def _print_summary(results: dict) -> None:
         print("  Lambdas (at checkpoint):")
         for k, v in results["checkpoint_lambdas"].items():
             print(f"    λ_{k}: {v:.6f}")
+    has_routing = any("routing_stats" in b for b in results.get("per_board", []))
+    if has_routing:
+        print("  Post-Placement Routing:")
+        for b in results["per_board"]:
+            if "routing_stats" in b:
+                rs = b["routing_stats"]
+                b_name = Path(b["board"]).name
+                print(
+                    f"    {b_name:25s} | Completion: {rs.get('completion_rate', 0.0)*100.0:5.1f}% | "
+                    f"WL: {rs.get('wirelength_mm', 0.0):6.1f}mm | Vias: {rs.get('num_vias', 0):3d} | "
+                    f"Time: {rs.get('route_time_s', 0.0):.2f}s"
+                )
     print("=" * 60 + "\n")
 
 
