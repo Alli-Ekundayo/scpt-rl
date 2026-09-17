@@ -90,3 +90,13 @@ def test_reset_reloads_fresh_placement():
     # The initial design has all components pre-placed (from the KiCad file),
     # but step_idx should be 0 after reset.
     assert env.state.step_idx == 0
+
+
+def test_custom_max_components():
+    from scpt.env.pcb_env import EnvConfig
+    cfg = EnvConfig(max_components=50)
+    env = PcbPlacementEnv(FIXTURE, cfg=cfg)
+    obs, _ = env.reset(seed=42)
+    assert env.observation_space["placed_comp_indices"].shape == (50,)
+    assert obs["placed_comp_indices"].shape == (50,)
+

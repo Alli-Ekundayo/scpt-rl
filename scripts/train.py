@@ -85,6 +85,8 @@ def build_models(cfg: SimpleNamespace):
 def _select_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
     return torch.device("cpu")
 
 
@@ -134,7 +136,7 @@ def load_checkpoint(
     dual_updater,
 ) -> int:
     """Load weights from a checkpoint. Returns the outer_iter it was saved at."""
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
     if "encoder_state" in ckpt:
         encoder.load_state_dict(ckpt["encoder_state"])
     policy.load_state_dict(ckpt["policy_state"])
@@ -393,6 +395,15 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     cfg = _load_cfg(args.config)
+    from scpt.utils import validate_cfg
+    validate_cfg(cfg, [
+        "model.d", "model.pair_dim", "model.n_heads", "model.n_layers",
+        "ppo.clip_eps", "ppo.gamma", "ppo.gae_lambda", "ppo.sigma",
+        "ppo.constraint_names", "ppo.constraint_budgets", "ppo.lr",
+        "ppo.epochs", "ppo.minibatch_size", "ppo.dual_alpha", "ppo.dual_ema_decay",
+        "ppo.n_outer_iters", "ppo.n_steps_per_iter",
+        "env.grid_resolution_mm", "env.min_spacing_mm",
+    ])
     run_dir = Path(args.run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     log_path = run_dir / "log.jsonl"

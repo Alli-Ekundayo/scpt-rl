@@ -20,12 +20,14 @@ feature math independently.
 """
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 import torch
 import torch.nn as nn
 
 from scpt.training.data import build_pair_features
+from scpt.utils import polygon_area
 
 
 class HeteroPCBEncoder(nn.Module):
@@ -101,7 +103,7 @@ def build_node_features(
     total_pads = 0
     for i, comp in enumerate(components):
         placed = positions[i] is not None if i < len(positions) else False
-        courtyard_area = _polygon_area(comp.get("footprint", {}).get("courtyard", {}))
+        courtyard_area = polygon_area(comp.get("footprint", {}).get("courtyard", {}).get("points", []))
         pads = comp.get("footprint", {}).get("pads", [])
         n_pads = len(pads)
         total_pads += n_pads
@@ -185,25 +187,14 @@ def encode_design(
     return z_comp_all, z_star, Z_placed
 
 
-def _polygon_area(courtyard: dict[str, Any]) -> float:
-    """Unsigned area of a simple polygon via the shoelace formula.
-
-    Assumes the courtyard polygon is simple (non-self-intersecting) and
-    coplanar, as produced by standard KiCad footprint parser outputs.
-    """
-    pts = courtyard.get("points", [])
-    if len(pts) < 3:
-        return 0.0
-    s = 0.0
-    n = len(pts)
-    for i in range(n):
-        j = (i + 1) % n
-        x_i, y_i = pts[i] if isinstance(pts[i], (list, tuple)) else (pts[i]["x"], pts[i]["y"])
-        x_j, y_j = pts[j] if isinstance(pts[j], (list, tuple)) else (pts[j]["x"], pts[j]["y"])
-        s += x_i * y_j - x_j * y_i
-    return abs(s) * 0.5
-
-
 def _hash_float(s: str) -> float:
-    """Deterministic string → float in [0, 1] for feature hashing."""
-    return (hash(s) % 10_000) / 10_000.0
+    """Deterministic string → float in [0, 1] for feature hashing.
+
+    Uses MD5 (first 4 bytes as a big-endian uint32) so the result is
+    identical across processes and PYTHONHASHSEED settings.  Python's
+    built-in ``hash()`` is randomised per-process by default which would
+    silently produce different net-name features between training and eval.
+    """
+    digest = hashlib.md5(s.encode(), usedforsecurity=False).digest()
+    uint32 = int.from_bytes(digest[:4], "big")
+    return (uint32 % 10_000) / 10_000.0

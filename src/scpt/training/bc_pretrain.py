@@ -101,12 +101,11 @@ class BCDataset:
         grid_cells = H * W
 
         # Build grid_xy tensor (static per board).
-        grid_xy = torch.zeros(grid_cells, 2)
-        for r in range(H):
-            for c in range(W):
-                idx = r * W + c
-                grid_xy[idx, 0] = bounds["x"] + (c + 0.5) * res
-                grid_xy[idx, 1] = bounds["y"] + (r + 0.5) * res
+        import numpy as np
+        cs = bounds["x"] + (np.arange(W) + 0.5) * res
+        rs = bounds["y"] + (np.arange(H) + 0.5) * res
+        xx, yy = np.meshgrid(cs, rs)
+        grid_xy = torch.from_numpy(np.stack([xx.ravel(), yy.ravel()], axis=-1).astype(np.float32))
 
         # Simulate the episode step-by-step, extracting expert actions.
         positions = design.get("placement", {}).get("positions", [None] * len(components))
@@ -250,20 +249,26 @@ def bc_pretrain(
 
     optimizer = optim.Adam(policy.parameters(), lr=cfg.lr)
     policy.train()
-
+    bc_batch_size = getattr(cfg, "bc_batch_size", 32)
+    
     for epoch in range(cfg.epochs):
         epoch_loss = 0.0
         n = 0
-        # Shuffle steps each epoch.
         perm = torch.randperm(len(steps)).tolist()
-        for i in perm:
-            step = steps[i]
+        
+        for batch_start in range(0, len(perm), bc_batch_size):
+            batch_indices = perm[batch_start:batch_start + bc_batch_size]
             optimizer.zero_grad()
-            loss = bc_loss(policy, step, cfg)
-            loss.backward()
+            batch_loss = torch.tensor(0.0, device=next(policy.parameters()).device)
+            for i in batch_indices:
+                step = steps[i]
+                loss = bc_loss(policy, step, cfg)
+                (loss / len(batch_indices)).backward()
+                batch_loss = batch_loss + loss.detach()
             optimizer.step()
-            epoch_loss += loss.item()
-            n += 1
+            epoch_loss += batch_loss.item()
+            n += len(batch_indices)
+        
         avg = epoch_loss / n if n > 0 else 0.0
         logger.debug("BC epoch %d/%d: avg_loss=%.4f", epoch + 1, cfg.epochs, avg)
 

@@ -72,65 +72,68 @@ class SCPTPolicy(nn.Module):
         # Final projection to logit over grid cells.
         self.logit_head = nn.Linear(d, 1)
 
-        # Learnable empty-context embedding used when P=0 (no placed components
-        # yet). Without this, the cross-attention has no K/V to attend to and
-        # the policy would just output a constant. The empty-context embedding
-        # gives the network something to learn from on the first step.
-        self.empty_context = nn.Parameter(torch.randn(d) * 0.02)
+        # Learnable empty-context embeddings used when P=0 (no placed components
+        # yet). Without K/V, the cross-attention has nothing to attend to and
+        # the policy would output a constant. Two separate parameters (one for K,
+        # one for V) let the network learn distinct lookup-key vs. read-value
+        # behaviours for the first placement step.
+        self.empty_context_k = nn.Parameter(torch.randn(d) * 0.02)
+        self.empty_context_v = nn.Parameter(torch.randn(d) * 0.02)
 
-    def forward(
-        self,
-        z_star: torch.Tensor,
-        Z_placed: torch.Tensor,
-        F_pair: torch.Tensor,
-        grid_xy: torch.Tensor,
-        action_mask: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, z_star, Z_placed, F_pair, grid_xy, action_mask, kv_mask=None):
         """Compute logits over grid cells.
-
+        
+        Supports both single-sample and batched inputs:
+        - Single: z_star (d,), Z_placed (P, d), grid_xy (L, 2), action_mask (L,)
+        - Batched: z_star (B, d), Z_placed (B, P, d), grid_xy (B, L, 2), action_mask (B, L)
+        
         Args:
             z_star: (d,) embedding of the active component from GNN encoder.
             Z_placed: (P, d) embeddings of placed components.
             F_pair: (P, pair_dim) live pair features between c* and each placed.
             grid_xy: (L, grid_spatial_dim) spatial coordinates of each grid cell.
             action_mask: (L,) float mask: 1.0 = legal, 0.0 = illegal.
+            kv_mask: optional (B, P) bool; True = padding in Z_placed/F_pair to ignore.
 
         Returns:
             logits: (L,) — logits over grid cells. Illegal cells get -inf.
         """
-        L = grid_xy.shape[0]
-        P = Z_placed.shape[0]
-
-        # Broadcast z_star to all L queries: (L, d + grid_spatial_dim)
-        z_star_broadcast = z_star.unsqueeze(0).expand(L, -1)
+        # Auto-batch single-sample inputs
+        unbatched = z_star.dim() == 1
+        if unbatched:
+            result = self.forward(
+                z_star.unsqueeze(0), Z_placed.unsqueeze(0), F_pair.unsqueeze(0),
+                grid_xy.unsqueeze(0), action_mask.unsqueeze(0), kv_mask=kv_mask,
+            )
+            return result.squeeze(0)
+        
+        B = z_star.shape[0]
+        L = grid_xy.shape[1]
+        P = Z_placed.shape[1]
+        
+        z_star_broadcast = z_star.unsqueeze(1).expand(B, L, -1)
         query_input = torch.cat([z_star_broadcast, grid_xy], dim=-1)
-        Q = self.query_proj(query_input)  # (L, d)
-
-        # K, V from placed components.
+        Q = self.query_proj(query_input)
+        
         if P == 0:
-            # Empty context: use learnable embedding as a single key/value.
-            # All L queries attend to the same "empty context" embedding.
-            empty_ctx = self.empty_context.unsqueeze(0)  # (1, d)
-            K = empty_ctx  # (1, d)
-            V = empty_ctx  # (1, d)
+            # Empty context: separate learnable K and V give the network the
+            # ability to learn distinct first-step lookup-key vs. read-value
+            # behaviours rather than conflating them into a single vector.
+            K = self.empty_context_k.unsqueeze(0).unsqueeze(0).expand(B, 1, -1)
+            V = self.empty_context_v.unsqueeze(0).unsqueeze(0).expand(B, 1, -1)
+            kv_mask = None
         else:
-            kv_input = torch.cat([Z_placed, F_pair], dim=-1)  # (P, d + pair_dim)
-            KV = self.kv_proj(kv_input)  # (P, 2d)
-            K, V = KV.split(self.d, dim=-1)  # each (P, d)
-
-        # Apply cross-attention layers.
-        H = Q  # (L, d)
+            kv_input = torch.cat([Z_placed, F_pair], dim=-1)
+            KV = self.kv_proj(kv_input)
+            K, V = KV.split(self.d, dim=-1)
+        
+        H = Q
         for layer in self.attn_layers:
-            H = layer(H, K, V)
-
-        # Final projection: (L, d) → (L, 1) → (L,)
+            H = layer(H, K, V, kv_mask=kv_mask)
+        
         logits = self.logit_head(H).squeeze(-1)
-
-        # Apply action mask: illegal cells → -inf (so softmax is zero there).
-        # Caller constructs the Categorical after this masking.
         illegal = action_mask < 0.5
         logits = logits.masked_fill(illegal, float("-inf"))
-
         return logits
 
 
@@ -157,35 +160,43 @@ class _CrossAttentionLayer(nn.Module):
             nn.Linear(d * 4, d),
         )
 
-    def forward(
-        self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, Q, K, V, kv_mask=None):
         """Cross-attention: Q queries attend to K/V keys.
-
+        
+        Supports both unbatched (L, d) and batched (B, L, d) inputs.
+        
         Args:
-            Q: (L, d) query embeddings (from grid cells).
-            K: (P, d) key embeddings (from placed components).
-            V: (P, d) value embeddings (from placed components).
-
-        Returns:
-            (L, d) updated query embeddings.
+            Q: (B, L, d) query embeddings.
+            K: (B, P, d) key embeddings.
+            V: (B, P, d) value embeddings.
+            kv_mask: optional (B, P) bool tensor; True = padding position to ignore.
+            
+        Note on LayerNorm placement:
+            This layer uses post-LN style (original "Attention Is All You Need"
+            convention): LayerNorm is applied *after* the residual addition.
+            Post-LN is stable for up to n_layers ≈ 6; if depth is scaled beyond
+            that, switch to pre-LN (apply norm to the residual branch input
+            before the sub-layer) to improve gradient flow.
         """
-        L, P = Q.shape[0], K.shape[0]
-        # Multi-head reshape: Q → (n_heads, L, head_dim); K,V → (n_heads, P, head_dim)
-        Q_r = self.q_proj(Q).view(L, self.n_heads, self.head_dim).transpose(0, 1)
-        K_r = self.k_proj(K).view(P, self.n_heads, self.head_dim).transpose(0, 1)
-        V_r = self.v_proj(V).view(P, self.n_heads, self.head_dim).transpose(0, 1)
-
-        # Scaled dot-product attention: (n_heads, L, P)
+        B, L, _ = Q.shape
+        P = K.shape[1]
+        Q_r = self.q_proj(Q).view(B, L, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+        K_r = self.k_proj(K).view(B, P, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+        V_r = self.v_proj(V).view(B, P, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+        
         scale = math.sqrt(self.head_dim)
         scores = torch.matmul(Q_r, K_r.transpose(-2, -1)) / scale
+        if kv_mask is not None:
+            scores = scores.masked_fill(kv_mask[:, None, None, :], float("-inf"))
         weights = F.softmax(scores, dim=-1)
-        attn_out = torch.matmul(weights, V_r)  # (n_heads, L, head_dim)
-        attn_out = attn_out.transpose(0, 1).contiguous().view(L, self.d)
+        # Handle NaN from all-masked rows (all -inf → softmax NaN)
+        weights = weights.nan_to_num(0.0)
+        attn_out = torch.matmul(weights, V_r)
+        attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(B, L, self.d)
         attn_out = self.out_proj(attn_out)
-
-        # Residual + LayerNorm.
+        
+        # Post-LN residual: norm applied after the residual addition.
         H = self.norm1(Q + attn_out)
-        # FFN residual.
+        # FFN residual (post-LN).
         H = self.norm2(H + self.ffn(H))
         return H

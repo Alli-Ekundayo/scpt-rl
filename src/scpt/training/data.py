@@ -12,6 +12,7 @@ Both functions operate on the parsed SCPT IR (a dict from `load_kicad_pcb`).
 """
 from __future__ import annotations
 
+from collections import defaultdict
 from typing import Any
 
 import torch
@@ -75,20 +76,11 @@ def functional_clusters(design: dict[str, Any]) -> list[int]:
 # BC/RL ordering
 # ---------------------------------------------------------------------------
 
+from scpt.utils import polygon_area
+
 def _courtyard_area(component: dict[str, Any]) -> float:
-    """Unsigned area of a polygon's point list via the shoelace formula."""
     pts = component.get("footprint", {}).get("courtyard", {}).get("points", [])
-    if len(pts) < 3:
-        return 0.0
-    s = 0.0
-    n = len(pts)
-    for i in range(n):
-        x_i, y_i = pts[i] if isinstance(pts[i], (list, tuple)) else (pts[i]["x"], pts[i]["y"])
-        j = (i + 1) % n
-        x_j, y_j = pts[j] if isinstance(pts[j], (list, tuple)) else (pts[j]["x"], pts[j]["y"])
-        s += x_i * y_j
-        s -= x_j * y_i
-    return abs(s) * 0.5
+    return polygon_area(pts)
 
 
 def _cluster_total_area(cluster_ids: list[int], component_areas: list[float]) -> dict[int, float]:
@@ -140,8 +132,10 @@ def find_symmetry_pairs(
 ) -> list[tuple[str, str]]:
     """Return pairs of components that should be symmetric:
     - diff-pair partners (from nets with `diff_pair_id` set)
-    - matched resistor/capacitor pairs in the same cluster (same ref_des prefix
-      letter 'R' or 'C' + same cluster, e.g. R1+R2, C3+C4)
+    - adjacent resistor/capacitor pairs within the same cluster (same ref_des
+      prefix letter 'R' or 'C', e.g. R1+R2, C3+C4).  Note: v1 does NOT
+      filter by component value — two R's in the same cluster are paired
+      regardless of resistance value.  Matching on value is a v2 improvement.
     """
     seen_pairs: set[tuple[str, str]] = set()
 
@@ -163,21 +157,20 @@ def find_symmetry_pairs(
     for net_name, partner_name in diff_partners.items():
         if partner_name not in net_by_name:
             continue
-        pads_a = {ref for ref, _ in net_by_name[net_name].get("pads", [])}
-        pads_b = {ref for ref, _ in net_by_name[partner_name].get("pads", [])}
+        comp_indices_a = {comp_idx for comp_idx, _ in net_by_name[net_name].get("pads", [])}
+        comp_indices_b = {comp_idx for comp_idx, _ in net_by_name[partner_name].get("pads", [])}
         # Pair up components on the P-side with components on the N-side.
         # Diff-pair relationships override cluster boundaries — even if R1
         # and R2 are in different functional clusters, if they carry CLK_P
         # and CLK_N respectively they should be mirrored.
-        for ci in pads_a:
-            for cj in pads_b:
+        for ci in comp_indices_a:
+            for cj in comp_indices_b:
                 if ci in comp_idx_to_ref and cj in comp_idx_to_ref:
                     ra, rb = comp_idx_to_ref[ci], comp_idx_to_ref[cj]
                     pair = tuple(sorted((ra, rb)))
                     seen_pairs.add(pair)
 
     # Matched R/C pairs in same cluster
-    from collections import defaultdict
     by_cluster_prefix: dict[tuple[int, str], list[str]] = defaultdict(list)
     for i, comp in enumerate(design["components"]):
         ref = comp["ref_des"]
@@ -231,9 +224,17 @@ def build_pair_features(
         if net.get("name")
     }
 
+    # Build {net_name: role} once — O(|nets|) — so per-component lookups are O(1)
+    # instead of the previous O(|active_nets| * |all_nets|) linear scan.
+    net_role_map: dict[str, str] = {
+        net["name"]: net.get("role", "signal")
+        for net in nets
+        if net.get("name")
+    }
+
     active_nets = comp_net_info.get(active_idx, {})
     active_net_names = set(active_nets)
-    active_role_counts = _net_role_counts(active_nets, nets)
+    active_role_counts = _net_role_counts(active_nets, net_role_map)
     active_pos = _component_position(design, active_idx)
     board_scale = _board_scale(design)
     active_netclass = (
@@ -250,16 +251,16 @@ def build_pair_features(
         placed_nets = comp_net_info.get(placed_idx, {})
         placed_net_names = set(placed_nets)
         shared_names = active_net_names & placed_net_names
-        placed_role_counts = _net_role_counts(placed_nets, nets)
+        placed_role_counts = _net_role_counts(placed_nets, net_role_map)
         placed_pos = _component_position(design, placed_idx)
         dx = placed_pos[0] - active_pos[0]
         dy = placed_pos[1] - active_pos[1]
         manhattan = abs(dx) + abs(dy)
         euclidean = (dx * dx + dy * dy) ** 0.5
 
-        shared_signal = _role_overlap(shared_names, nets, "signal")
-        shared_power = _role_overlap(shared_names, nets, "power")
-        shared_ground = _role_overlap(shared_names, nets, "ground")
+        shared_signal = _role_overlap(shared_names, net_role_map, "signal")
+        shared_power = _role_overlap(shared_names, net_role_map, "power")
+        shared_ground = _role_overlap(shared_names, net_role_map, "ground")
         shared_diff_pair = _diff_pair_overlap(active_net_names, placed_net_names, diff_pair_map)
         same_cluster = 0.0
         if 0 <= active_idx < len(cluster_ids) and 0 <= placed_idx < len(cluster_ids):
@@ -326,18 +327,31 @@ def _component_netclass(component: dict[str, Any]) -> str | None:
     return str(netclass_hint) if netclass_hint is not None else None
 
 
-def _net_role_counts(nets_by_name: dict[str, dict[str, Any]], all_nets: list[dict[str, Any]]) -> dict[str, float]:
+def _net_role_counts(
+    nets_by_name: dict[str, dict[str, Any]],
+    net_role_map: dict[str, str],
+) -> dict[str, float]:
+    """Count signal/power/ground nets for a component using a pre-built role map.
+
+    Accepts a ``net_role_map`` dict (``{net_name: role}``) built once per
+    call-site so each lookup is O(1) rather than a linear scan over all nets.
+    """
     counts = {"signal": 0.0, "power": 0.0, "ground": 0.0}
     for net_name in nets_by_name:
-        role = next((net.get("role") for net in all_nets if net.get("name") == net_name), "signal")
+        role = net_role_map.get(net_name, "signal")
         if role in counts:
             counts[role] += 1.0
     return counts
 
 
-def _role_overlap(shared_names: set[str], all_nets: list[dict[str, Any]], role: str) -> float:
-    for net in all_nets:
-        if net.get("name") in shared_names and net.get("role") == role:
+def _role_overlap(
+    shared_names: set[str],
+    net_role_map: dict[str, str],
+    role: str,
+) -> float:
+    """Return 1.0 if any shared net has the given role, else 0.0."""
+    for name in shared_names:
+        if net_role_map.get(name) == role:
             return 1.0
     return 0.0
 

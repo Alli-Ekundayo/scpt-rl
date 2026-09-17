@@ -108,7 +108,11 @@ def test_forward_all_cells_illegal_returns_all_neg_inf():
 
 
 def test_forward_empty_context_gradient_flow():
-    """When P=0, gradients must flow through the learnable empty_context parameter."""
+    """When P=0, gradients must flow through both empty_context_k and empty_context_v.
+
+    F15 fix: the parameter was split into separate K and V vectors so the network
+    can learn distinct lookup-key vs. read-value behaviours for the first step.
+    """
     pol = SCPTPolicy(d=32, pair_dim=14, n_heads=2, n_layers=1)
     L = 4
     z_star = torch.randn(32, requires_grad=True)
@@ -121,8 +125,11 @@ def test_forward_empty_context_gradient_flow():
     loss = logits[0]
     loss.backward()
 
-    assert pol.empty_context.grad is not None
-    assert torch.isfinite(pol.empty_context.grad).all()
+    # Both empty-context parameters must receive gradients when P=0.
+    assert pol.empty_context_k.grad is not None
+    assert torch.isfinite(pol.empty_context_k.grad).all()
+    assert pol.empty_context_v.grad is not None
+    assert torch.isfinite(pol.empty_context_v.grad).all()
     assert z_star.grad is not None
     assert torch.isfinite(z_star.grad).all()
 

@@ -23,10 +23,21 @@ use global_param::GlobalParam;
 /// internally but the result is not yet serialized back to the SCPT IR.
 /// A future pass will add segment/via serialization.
 #[pyfunction]
-fn route(design_json: &str) -> PyResult<String> {
+#[pyo3(signature = (design_json, num_iterations=None, grid_scale=None))]
+fn route(
+    design_json: &str,
+    num_iterations: Option<u32>,
+    grid_scale: Option<u32>,
+) -> PyResult<String> {
     let db = scpt_adapter::scpt_json_to_kicad_db(design_json)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
-    let params = GlobalParam::default();
+    let mut params = GlobalParam::default();
+    if let Some(n) = num_iterations {
+        params.num_rip_up_reroute_iteration = n;
+    }
+    if let Some(s) = grid_scale {
+        params.set_grid_scale(s);
+    }
     let mut router = GridBasedRouter::new(params);
     router.setup_layer_mapping(&db);
     // Set up netclasses from the DB.

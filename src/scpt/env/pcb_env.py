@@ -36,6 +36,7 @@ class EnvConfig:
     w_therm: float = 1.0
     w_sym: float = 1.0
     decap_radius_mm: float = 2.0
+    max_components: int = 10_000
 
 
 @dataclass
@@ -78,16 +79,14 @@ class PcbPlacementEnv(gym.Env):
         self.observation_space = gym.spaces.Dict({
             "action_mask": gym.spaces.Box(0.0, 1.0, shape=(self.H * self.W,), dtype=np.float32),
             "grid_xy": gym.spaces.Box(-1e6, 1e6, shape=(self.H * self.W, 2), dtype=np.float32),
-            "placed_comp_indices": gym.spaces.Box(0, 10_000, shape=(10_000,), dtype=np.int64),
+            "placed_comp_indices": gym.spaces.Box(0, self.cfg.max_components, shape=(self.cfg.max_components,), dtype=np.int64),
         })
 
         # Pre-compute static grid coordinates (don't change across episodes).
-        self._grid_xy = np.zeros((self.H * self.W, 2), dtype=np.float32)
-        for r in range(self.H):
-            for c in range(self.W):
-                idx = r * self.W + c
-                self._grid_xy[idx, 0] = bounds["x"] + (c + 0.5) * self.cfg.grid_resolution_mm
-                self._grid_xy[idx, 1] = bounds["y"] + (r + 0.5) * self.cfg.grid_resolution_mm
+        cs = bounds["x"] + (np.arange(self.W) + 0.5) * self.cfg.grid_resolution_mm
+        rs = bounds["y"] + (np.arange(self.H) + 0.5) * self.cfg.grid_resolution_mm
+        xx, yy = np.meshgrid(cs, rs)
+        self._grid_xy = np.stack([xx.ravel(), yy.ravel()], axis=-1).astype(np.float32)
 
         self.state: _EnvState | None = None
 
@@ -97,9 +96,10 @@ class PcbPlacementEnv(gym.Env):
 
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         super().reset(seed=seed)
+        import copy
         # Reload fresh JSON so each episode starts from the expert placement.
-        design_json = pcb_parser.load_kicad_pcb(self.board_path)
-        design = json.loads(design_json)
+        design_json = self._initial_json
+        design = copy.deepcopy(json.loads(self._initial_json))
         placement_order = design["placement"]["placement_order"]
         self.state = _EnvState(
             design_json=design_json,
@@ -113,7 +113,8 @@ class PcbPlacementEnv(gym.Env):
         return self._build_obs(), {}
 
     def step(self, action: int):
-        assert self.state is not None, "step() called before reset()"
+        if self.state is None:
+            raise RuntimeError("step() called before reset()")
         st = self.state
 
         # Action is flat grid index. Convert to world coords.
@@ -145,7 +146,8 @@ class PcbPlacementEnv(gym.Env):
         st.design_json = json.dumps(st.design)
 
         # Compute costs.
-        costs = self._compute_costs(active_ref_des)
+        bounds = st.design["board"]["bounds"]
+        costs = self._compute_costs(active_ref_des, bounds)
 
         # Check infeasibility for next step.
         next_active_idx = (
@@ -165,7 +167,6 @@ class PcbPlacementEnv(gym.Env):
         # brings the reward to O(−10), commensurate with normalised advantages.
         # Constraint costs (clearance, partition) are handled exclusively
         # by the PPO-EAL Lagrangian — not subtracted from reward.
-        bounds = st.design["board"]["bounds"]
         board_diag = math.sqrt(bounds["w"] ** 2 + bounds["h"] ** 2)
         reward = -costs.get("c_hpwl", 0.0) / max(board_diag, 1.0)
 
@@ -173,24 +174,27 @@ class PcbPlacementEnv(gym.Env):
         return self._build_obs(), reward, terminated, False, {"costs": costs}
 
     def current_design(self) -> dict:
-        assert self.state is not None, "env not reset"
+        if self.state is None:
+            raise RuntimeError("step() called before reset()")
         return self.state.design
 
     def current_active_index(self) -> int | None:
-        assert self.state is not None, "env not reset"
+        if self.state is None:
+            raise RuntimeError("step() called before reset()")
         if self.state.step_idx >= len(self.state.placement_order):
             return None
         return self.state.placement_order[self.state.step_idx]
 
     def current_placed_indices(self) -> list[int]:
-        assert self.state is not None, "env not reset"
+        if self.state is None:
+            raise RuntimeError("step() called before reset()")
         return list(self.state.placement_order[: self.state.step_idx])
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
-    def _compute_costs(self, moved_ref_des: str) -> dict[str, float]:
+    def _compute_costs(self, moved_ref_des: str, bounds: dict | None = None) -> dict[str, float]:
         """Call pcb_parser primitives for the current design state.
 
         Normalisation
@@ -203,8 +207,15 @@ class PcbPlacementEnv(gym.Env):
           for a clean one — commensurate with the reward signal.
         * ``c_hpwl``: raw HPWL is in mm (O(500)–O(2000)).  Normalisation
           happens in ``step()`` where it enters the reward.
+        * ``c_partition``: **placeholder — always 0.0 in v1.**  The partition-
+          cut cost will be exposed by ``pcb_parser.partition_cut`` in a future
+          Rust release.  Until then the constraint critic for ``c_partition``
+          trains on identically-zero cost signal and its λ stays near zero.
+          Remove ``c_partition`` from ``constraint_names`` in the config if
+          you want to skip the phantom constraint entirely.
         """
-        bounds = self.state.design["board"]["bounds"]
+        if bounds is None:
+            bounds = self.state.design["board"]["bounds"]
         board_area = bounds["w"] * bounds["h"]
         raw_clearance = pcb_parser.clearance_cost(
             self.state.design_json, self.cfg.min_spacing_mm
@@ -213,7 +224,7 @@ class PcbPlacementEnv(gym.Env):
             # Dimensionless: overlap_area_mm2 / board_area_mm2.
             "c_clearance": raw_clearance / max(board_area, 1.0),
             "c_hpwl": pcb_parser.hpwl_incremental(self.state.design_json, moved_ref_des),
-            # v1: partition cut not exposed yet — use 0.
+            # v1: partition cut not exposed yet — always 0.0; see docstring above.
             "c_partition": 0.0,
             "b_partition": 1.15 * self.cfg.expert_cut_cost,
             # v1: Tier 2 sub-scores not exposed yet via PyO3 — use 0.
@@ -229,6 +240,7 @@ class PcbPlacementEnv(gym.Env):
         available in the design dict.
         """
         mask = np.ones(self.H * self.W, dtype=np.float32)
+        mask_2d = mask.reshape(self.H, self.W)
         res = self.cfg.grid_resolution_mm
         margin_cells = max(1, int(math.ceil(self.cfg.min_spacing_mm / res)))
         board_bounds = self.state.design["board"]["bounds"]
@@ -274,12 +286,13 @@ class PcbPlacementEnv(gym.Env):
                 half_h = 2 + margin_cells
 
             # Mask rectangular region around placed component.
-            for dy in range(-half_h, half_h + 1):
-                for dx in range(-half_w, half_w + 1):
-                    gx, gy = cx + dx, cy + dy
-                    if 0 <= gx < self.W and 0 <= gy < self.H:
-                        mask[gy * self.W + gx] = 0.0
-        return mask
+            r_min = max(0, cy - half_h)
+            r_max = min(self.H, cy + half_h + 1)
+            c_min = max(0, cx - half_w)
+            c_max = min(self.W, cx + half_w + 1)
+            mask_2d[r_min:r_max, c_min:c_max] = 0.0
+
+        return mask_2d.ravel()
 
     def _build_obs(self) -> dict[str, np.ndarray]:
         st = self.state
@@ -288,9 +301,10 @@ class PcbPlacementEnv(gym.Env):
         for i, p in enumerate(st.design["placement"]["positions"]):
             if p is not None:
                 placed.append(i)
-        placed_arr = np.zeros(10_000, dtype=np.int64)
+        max_components = self.cfg.max_components
+        placed_arr = np.zeros(max_components, dtype=np.int64)
         for j, idx in enumerate(placed):
-            if j >= 10_000:
+            if j >= max_components:
                 break
             placed_arr[j] = idx
 

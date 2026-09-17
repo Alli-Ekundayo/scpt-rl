@@ -236,9 +236,16 @@ pub fn orient_score(d: &PcbDesign, partition: &PartitionSpec) -> f64 {
     let ys: Vec<f64> = positions.iter().map(|p| p.1).collect();
     let vx = variance(&xs);
     let vy = variance(&ys);
-    // Map variance → score. var=0 → 1.0; var≥100mm² → ~0.0
+    // Map variance → score via reciprocal scaling.
+    //   SCALING_FACTOR = 0.01 mm⁻²:
+    //     var =   0 mm² → score = 1.0   (perfectly regular)
+    //     var = 100 mm² → score = 0.5   (moderate spread)
+    //     var = 1000 mm² → score ≈ 0.09  (scattered)
+    // Chosen so that clusters within ~10 mm of their centroid score > 0.5,
+    // matching the DRC clearance scale in typical 50–100 mm boards.
+    const VARIANCE_SCALING: f64 = 0.01;
     let mean_var = (vx + vy) * 0.5;
-    (1.0 + mean_var * 0.01).recip().max(0.0).min(1.0)
+    (1.0 + mean_var * VARIANCE_SCALING).recip().max(0.0).min(1.0)
 }
 
 fn variance(xs: &[f64]) -> f64 {
@@ -379,7 +386,7 @@ mod tests {
     use super::*;
     use crate::ir::{
         BoardGeometry, Component, Footprint, LayerSet, Net, Pad, PadShape, PinElectricalProxy,
-        Polygon, Rect,
+        PlacementState, Polygon, Rect,
     };
 
     fn design_with_two_placed_components() -> PcbDesign {

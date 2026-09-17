@@ -180,8 +180,12 @@ Reports: mean reward, BC eval loss, constraint costs, per-board breakdown, and
 the Lagrangian multiplier values frozen in the checkpoint.
 
 > **Note on Metrics:** BC eval loss measures distance from expert demonstrations
-> under teacher-forcing supervision, whereas rollout reward measures autonomous
-> policy placement quality under greedy execution.
+> under teacher-forcing supervision (cross-entropy of the policy's logit for the
+> expert cell), whereas rollout reward measures autonomous policy placement quality
+> under **greedy** execution.  These two numbers are deliberately decoupled: a
+> policy can improve its greedy reward while BC loss increases (it has found a
+> better strategy than the expert), or vice versa.  Do not use them as proxies
+> for each other.
 
 ---
 
@@ -262,6 +266,16 @@ The bridge is a boundary, not a layer — no logic, no caching.
 | `env.grid_resolution_mm` | 0.5 | Grid cell size (mm) |
 
 See [`configs/default.yaml`](configs/default.yaml) for the complete reference.
+
+### Alternate config profiles
+
+| File | Purpose |
+|------|---------|
+| `configs/default.yaml` | Full-scale training (default) |
+| `configs/smoke.yaml` | Tiny CI / dev smoke-test (small grid, 1 board) |
+| `configs/default_low_batch.yaml` | Reduced `minibatch_size` for GPU-constrained runs |
+| `configs/default_low_batch2.yaml` | Further-reduced batch size (alternative low-memory profile) |
+| `configs/default_high_res.yaml` | High-resolution grid (`grid_resolution_mm=0.25`) for fine placement |
 
 ---
 

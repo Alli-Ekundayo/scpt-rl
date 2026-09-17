@@ -51,21 +51,25 @@ class ValueHeads(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, z_comp: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(self, z_comp: torch.Tensor, pre_pooled: bool = False) -> dict[str, torch.Tensor]:
         """Graph-level readout (mean-pool v1) → separate critic values.
 
         Args:
             z_comp: (N, d) per-node embeddings from the GNN encoder.
                     v1 uses mean-pooling; a future `[GRAPH]` virtual node
                     would bypass pooling.
+            pre_pooled: If True, indicates z_comp is already pooled (B, d) or (d,).
 
         Returns:
             dict mapping "reward" + each constraint name → scalar tensor.
         """
-        if z_comp.shape[0] == 0:
-            g = torch.zeros(self.d, device=z_comp.device, dtype=z_comp.dtype)
+        if pre_pooled:
+            g = z_comp
         else:
-            g = z_comp.mean(dim=0)  # (d,) graph-level readout
+            if z_comp.shape[0] == 0:
+                g = torch.zeros(self.d, device=z_comp.device, dtype=z_comp.dtype)
+            else:
+                g = z_comp.mean(dim=0)  # (d,) graph-level readout
         out = {"reward": self.reward_critic(g).squeeze(-1)}
         for name, head in self.constraint_critics.items():
             out[name] = head(g).squeeze(-1)

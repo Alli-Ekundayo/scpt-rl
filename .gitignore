@@ -22,7 +22,7 @@ dist-info/
 .vscode/
 
 # OS noise
-.DS_Store
+**/.DS_Store
 Thumbs.db
 
 # Local secrets / keys

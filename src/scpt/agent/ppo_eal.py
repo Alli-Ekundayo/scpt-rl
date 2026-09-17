@@ -30,6 +30,9 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 import numpy as np
 import torch
@@ -186,6 +189,11 @@ class RolloutBuffer:
     Action masks and grid coordinates are stored at collection time and never
     recomputed during the loss pass — this prevents the mask-staleness bug where
     the policy distribution shifts during the update and illegal actions become legal.
+
+    Memory note: each ``obs`` dict in ``obs_list`` may contain a ``'design'`` key
+    holding a large parsed JSON dict (~10–100 kB per board).  For ``n_steps=512``
+    on a 500-component board this can reach ~50 MB of live Python objects.  Call
+    ``buffer.clear()`` promptly after the update step to release that memory.
     """
     constraint_names: list[str]
     # Per-step fields (stored in collection order).
@@ -372,10 +380,21 @@ class PPOEALTrainer:
     def _compute_value(
         self, obs: dict
     ) -> dict[str, torch.Tensor]:
-        """Estimate V(s) for the reward and each constraint."""
-        z_star, Z_placed, F_pair, grid_xy, action_mask = self._get_policy_inputs(obs)
-        if Z_placed.shape[0] == 0:
-            Z_placed = torch.zeros(1, self.cfg.d, device=self.device)
+        """Estimate V(s) for the reward and each constraint.
+
+        Uses ``z_comp_all`` (full-design GNN embedding, all N components) when
+        available so the critic readout is stable across episode steps.  Falls
+        back to ``Z_placed`` (placed-component embeddings) for legacy obs formats
+        without an encoder, which is consistent with how v1 FakeEnv tests supply
+        observations.  An empty ``z_comp_all`` produces a zero readout via
+        ``ValueHeads.forward``’s explicit fallback path rather than a NaN.
+        """
+        z_comp_all = obs.get("z_comp_all")
+        if z_comp_all is not None:
+            z_comp_all = z_comp_all.to(device=self.device)
+            return self.value_heads(z_comp_all)
+        # Legacy / no-encoder path: fall back to placed-component embeddings.
+        _, Z_placed, _, _, _ = self._get_policy_inputs(obs)
         return self.value_heads(Z_placed)
 
     def _prepare_obs(self, env, obs: dict) -> dict:
@@ -411,7 +430,8 @@ class PPOEALTrainer:
                 return {k: v.cpu() if torch.is_tensor(v) else v for k, v in prepared.items()}
 
             with torch.no_grad():
-                # We compute these but don't store them - we'll reconstruct from design data
+                # Compute full-design embeddings; store z_comp_all for the critic
+                # so it receives a stable N-component readout regardless of episode step.
                 z_comp_all, z_star, Z_placed = encode_design(design, self.encoder, active_idx, placed_indices)
 
             F_pair = torch.zeros((len(placed_indices), self.cfg.pair_dim), dtype=torch.float32, device=self.device)
@@ -423,19 +443,23 @@ class PPOEALTrainer:
                     F_pair = pair_features.to(device=self.device)
                 elif pair_features.numel() > 0:
                     F_pair = pair_features[:, : self.cfg.pair_dim].to(device=self.device)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("build_pair_features failed: %s", exc)
 
             # Store reconstruction format (compact)
             z_star_cpu = z_star.cpu()
             Z_placed_cpu = Z_placed.cpu()
+            z_comp_all_cpu = z_comp_all.cpu()
             return {
-                "design": design,
                 "active_idx": active_idx,
                 "placed_indices": placed_indices,
                 # Store these tensors on CPU for immediate use during rollout collection
                 "z_star": z_star_cpu,
                 "Z_placed": Z_placed_cpu,
+                # z_comp_all: full-design embedding for the value critic (N2 fix).
+                # Keeps critic input stable across episode steps instead of using
+                # only the growing Z_placed slice.
+                "z_comp_all": z_comp_all_cpu,
                 "action_mask": prepared["action_mask"].cpu(),
                 "grid_xy": prepared["grid_xy"].cpu(),
                 "F_pair": F_pair.cpu(),
@@ -541,9 +565,20 @@ class PPOEALTrainer:
         next_value: torch.Tensor,
         gamma: float,
         gae_lambda: float,
+        legal_flags: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute GAE for a single constraint signal, masked by legal actions."""
-        T = len(self.buffer)
+        """Compute GAE for a single constraint signal, masked by legal actions.
+
+        Args:
+            legal_flags: (T,) float tensor; 1.0 where the stored action was
+                legal (i.e. within the mask), 0.0 otherwise.  Passed in from
+                ``_ppo_eal_update`` to avoid recomputing the mask check (N3 fix).
+
+        Returns:
+            (T,) tensor of GAE values zeroed at illegal steps.  Std
+            normalisation in the caller should be performed over legal entries
+            only — see the N1 note in ``_ppo_eal_update``.
+        """
         costs_t = torch.tensor(
             [_to_scalar(step.get(constraint_name, 0.0)) for step in self.buffer.costs],
             dtype=torch.float32,
@@ -559,12 +594,6 @@ class PPOEALTrainer:
             dtype=torch.float32,
             device=self.device,
         )
-        legal_flags = torch.zeros(T, device=self.device)
-        for t, (action, mask) in enumerate(zip(self.buffer.actions, self.buffer.action_masks)):
-            mask_cpu = mask.detach().cpu()
-            if 0 <= action < len(mask_cpu) and float(mask_cpu[action]) > 0.5:
-                legal_flags[t] = 1.0
-
         raw_gae = compute_gae(costs_t, values, dones, next_value.to(self.device), gamma, gae_lambda)
         # Weight by legal_flags so illegal actions do not bias constraint advantage expectations
         return raw_gae * legal_flags
@@ -581,7 +610,7 @@ class PPOEALTrainer:
         T = len(self.buffer)
 
         # ------------------------------------------------------------------
-        # Compute legal flags across rollout
+        # Compute legal flags across rollout (once; passed to helpers).
         # ------------------------------------------------------------------
         legal_flags = torch.zeros(T, device=self.device)
         for t, (action, mask) in enumerate(zip(self.buffer.actions, self.buffer.action_masks)):
@@ -631,7 +660,7 @@ class PPOEALTrainer:
         constraint_returns: dict[str, torch.Tensor] = {}
         for name in self.cfg.constraint_names:
             next_v = last_value_dict.get(name, torch.tensor(0.0, device=self.device))
-            c_advs = self._compute_constraint_gae(name, next_v, gamma, lam)
+            c_advs = self._compute_constraint_gae(name, next_v, gamma, lam, legal_flags)
             constraint_advs_dict[name] = c_advs
             # Constraint critic targets: raw GAE advantages + stored V_c(s_t).
             c_values = torch.tensor(
@@ -651,11 +680,24 @@ class PPOEALTrainer:
             phi = j_c + (1.0 / (1.0 - gamma)) * c_adv_legal_mean - budget
             phi_c_estimates[name] = phi
 
-        # Pre-normalize constraint advantages for policy gradient (F3)
+        # Pre-normalize constraint advantages for policy gradient.
+        #
+        # N1 FIX: compute std only over *legal* steps (non-zero entries after
+        # masking by legal_flags).  Computing std over the full T-length vector
+        # — which has zeros at illegal steps — underestimates the true scale by
+        # roughly sqrt(1 / legal_fraction), inflating the effective gradient
+        # magnitude for the constraint terms.
         c_advs_norm_dict: dict[str, torch.Tensor] = {}
+        legal_mask = legal_flags.bool()
         for cname in self.cfg.constraint_names:
             c_adv_raw = constraint_advs_dict[cname]
-            c_adv_std = c_adv_raw.std().clamp(min=1e-6)
+            # Take std only over entries corresponding to legal actions.
+            c_adv_legal = c_adv_raw[legal_mask]
+            if c_adv_legal.numel() > 1:
+                c_adv_std = c_adv_legal.std().clamp(min=1e-6)
+            else:
+                c_adv_std = torch.tensor(1.0, device=self.device)
+            # Divide the full vector; illegal entries remain zero after masking.
             c_advs_norm_dict[cname] = c_adv_raw / c_adv_std
 
         num_constraints = max(len(self.cfg.constraint_names), 1)
@@ -677,116 +719,134 @@ class PPOEALTrainer:
         for _ in range(self.cfg.epochs):
             indices = torch.randperm(T)
             mb = self.cfg.minibatch_size
-
             for start in range(0, T, mb):
                 idx = indices[start:start + mb]
                 self.optimizer.zero_grad()
-
                 batch_size = idx.numel()
-                batch_policy_surr = 0.0
-                batch_value_loss = 0.0
-                batch_constraint_pen = 0.0
-
-                # ----------------------------------------------------------
-                # Gradient accumulation: one item at a time
-                # ----------------------------------------------------------
+                
+                # ---- Collect and pad batch inputs ----
+                batch_z_stars = []
+                batch_Z_placed = []
+                batch_F_pairs = []
+                batch_grid_xys = []
+                batch_masks = []
+                batch_actions_list = []
+                batch_graph_readouts = []
+                max_P = 0
+                
                 for i_tensor in idx:
                     i = i_tensor.item()
                     obs_i = self.buffer.obs_list[i]
-
-                    # ---- reconstruct / move inputs to GPU -----------------
-                    z_star = obs_i.get("z_star")
-                    Z_placed = obs_i.get("Z_placed")
-                    design = obs_i.get("design")
-                    design_json = obs_i.get("design_json")
-                    active_idx = obs_i.get("active_idx")
-                    placed_indices = obs_i.get("placed_indices")
-                    F_pair = obs_i.get("F_pair")
-
-                    if (z_star is not None and torch.is_tensor(z_star) and
-                            Z_placed is not None and torch.is_tensor(Z_placed)):
-                        z_star = z_star.to(device=self.device)
-                        Z_placed = Z_placed.to(device=self.device)
-                    elif ((design is not None or design_json is not None) and active_idx is not None
-                            and placed_indices is not None):
-                        if design is None and design_json is not None:
-                            design = json.loads(design_json)
-                        _, z_star, Z_placed = encode_design(
-                            design, self.encoder, active_idx, placed_indices
-                        )
-                    else:
-                        z_star = torch.zeros(self.cfg.d, device=self.device)
-                        Z_placed = torch.zeros(0, self.cfg.d, device=self.device)
-
-                    if F_pair is not None:
-                        F_pair = F_pair.to(device=self.device)
-                    else:
-                        F_pair = torch.zeros(0, self.cfg.pair_dim, device=self.device)
-
+                    z_star, Z_placed, F_pair, _, _ = self._get_policy_inputs(obs_i)
+                    
+                    # Ensure we use the exact grid/mask stored during rollout
                     grid_xy = self.buffer.grid_xys[i] if i < len(self.buffer.grid_xys) else obs_i["grid_xy"]
                     mask = self.buffer.action_masks[i]
                     if torch.is_tensor(grid_xy) and grid_xy.device != self.device:
                         grid_xy = grid_xy.to(device=self.device)
                     if torch.is_tensor(mask) and mask.device != self.device:
                         mask = mask.to(device=self.device)
-
-                    # ---- policy forward ----------------------------------
-                    logits = self.policy(z_star, Z_placed, F_pair, grid_xy, mask)
-                    dist = torch.distributions.Categorical(logits=logits)
-                    action_i = torch.tensor(self.buffer.actions[i], device=self.device)
-                    lp = dist.log_prob(action_i)
-
-                    ratio = (lp - old_log_probs[i]).exp()
-                    adv = reward_advs[i]
-
-                    unclipped = ratio * adv
-                    clipped = torch.clamp(
-                        ratio, 1.0 - self.cfg.clip_eps, 1.0 + self.cfg.clip_eps
-                    ) * adv
-                    surr_i = torch.minimum(unclipped, clipped)
-
-                    # Constraint penalty via linear Lagrangian:
-                    # (1 / |C|) * sum_c lambda_c * ratio * A_c_i (normalized across constraints, F2)
-                    constraint_penalty_i = torch.zeros((), device=self.device)
-                    for cname in self.cfg.constraint_names:
-                        c_adv_i = c_advs_norm_dict[cname][i]
-                        constraint_penalty_i = constraint_penalty_i + lambdas[cname] * ratio * c_adv_i
-                    constraint_penalty_i = constraint_penalty_i / num_constraints
-
-                    # Scale by batch size so the mean gradient is preserved
-                    policy_loss_i = (-surr_i + constraint_penalty_i) / batch_size
-                    policy_loss_i.backward()
-                    batch_policy_surr += surr_i.item()
-                    batch_constraint_pen += constraint_penalty_i.item()
-
-                    # ---- value forward: reward critic + constraint critics ----
-                    Z_v = Z_placed
-                    if Z_v.shape[0] == 0:
-                        Z_v = torch.zeros(0, self.cfg.d, device=self.device)
-                    v_preds = self.value_heads(Z_v)
-
-                    # Reward critic loss.
-                    v_loss_i = 0.5 * (v_preds["reward"] - reward_returns[i]).pow(2) / batch_size
-                    v_loss_i.backward()
-                    batch_value_loss += v_loss_i.item() * batch_size
-
-                    # Constraint critic losses (one per constraint).
-                    for cname in self.cfg.constraint_names:
-                        v_pred_c = v_preds[cname]
-                        v_loss_c_i = (
-                            0.5 * (v_pred_c - constraint_returns[cname][i]).pow(2) / batch_size
-                        )
-                        v_loss_c_i.backward()
-                        batch_value_loss += v_loss_c_i.item() * batch_size
-
-                # Gradient clipping to prevent instability from large costs.
+                        
+                    batch_z_stars.append(z_star)
+                    batch_Z_placed.append(Z_placed)
+                    batch_F_pairs.append(F_pair)
+                    batch_grid_xys.append(grid_xy)
+                    batch_masks.append(mask)
+                    batch_actions_list.append(self.buffer.actions[i])
+                    max_P = max(max_P, Z_placed.shape[0])
+                    
+                    # Pre-pool for value head
+                    z_comp_all = obs_i.get("z_comp_all")
+                    if z_comp_all is not None:
+                        Z_v = z_comp_all.to(device=self.device)
+                    else:
+                        Z_v = Z_placed
+                    g = Z_v.mean(dim=0) if Z_v.shape[0] > 0 else torch.zeros(self.cfg.d, device=self.device)
+                    batch_graph_readouts.append(g)
+                
+                # Stack fixed-size tensors
+                z_star_batch = torch.stack(batch_z_stars)
+                grid_xy_batch = torch.stack(batch_grid_xys)
+                mask_batch = torch.stack(batch_masks)
+                actions_batch = torch.tensor(batch_actions_list, device=self.device)
+                g_batch = torch.stack(batch_graph_readouts)
+                
+                # Pad variable-size Z_placed and F_pair
+                effective_P = max(max_P, 1)  # at least 1 for empty context
+                kv_mask_batch = None
+                if max_P > 0:
+                    Z_padded = []
+                    F_padded = []
+                    kv_mask_list = []
+                    for zp, fp in zip(batch_Z_placed, batch_F_pairs):
+                        P_j = zp.shape[0]
+                        pad_len = max_P - P_j
+                        if pad_len > 0:
+                            zp = torch.nn.functional.pad(zp, (0, 0, 0, pad_len))
+                            fp = torch.nn.functional.pad(fp, (0, 0, 0, pad_len))
+                        Z_padded.append(zp)
+                        F_padded.append(fp)
+                        m = torch.zeros(max_P, dtype=torch.bool, device=self.device)
+                        m[P_j:] = True
+                        kv_mask_list.append(m)
+                    Z_placed_batch = torch.stack(Z_padded)
+                    F_pair_batch = torch.stack(F_padded)
+                    kv_mask_batch = torch.stack(kv_mask_list)
+                    # If all samples have same P, no masking needed
+                    if not kv_mask_batch.any():
+                        kv_mask_batch = None
+                else:
+                    Z_placed_batch = torch.zeros(batch_size, 0, self.cfg.d, device=self.device)
+                    F_pair_batch = torch.zeros(batch_size, 0, self.cfg.pair_dim, device=self.device)
+                
+                # ---- Batched policy forward ----
+                logits = self.policy(z_star_batch, Z_placed_batch, F_pair_batch, 
+                                     grid_xy_batch, mask_batch, kv_mask=kv_mask_batch)
+                dist = torch.distributions.Categorical(logits=logits)
+                lps = dist.log_prob(actions_batch)
+                
+                ratios = (lps - old_log_probs[idx]).exp()
+                advs = reward_advs[idx]
+                surr = torch.minimum(
+                    ratios * advs,
+                    torch.clamp(ratios, 1.0 - self.cfg.clip_eps, 1.0 + self.cfg.clip_eps) * advs,
+                )
+                
+                # Constraint penalty
+                constraint_pen = torch.zeros(batch_size, device=self.device)
+                for cname in self.cfg.constraint_names:
+                    c_adv = c_advs_norm_dict[cname][idx]
+                    constraint_pen = constraint_pen + lambdas[cname] * ratios * c_adv
+                constraint_pen = constraint_pen / num_constraints
+                
+                policy_loss = (-surr + constraint_pen).mean()
+                policy_loss.backward()
+                
+                batch_policy_surr = surr.sum().item()
+                batch_constraint_pen = constraint_pen.sum().item()
+                
+                # ---- Batched value forward ----
+                # g_batch is (B, d) pre-pooled graph readouts
+                v_preds = self.value_heads(g_batch, pre_pooled=True)
+                v_preds_reward = v_preds["reward"]
+                v_loss = 0.5 * (v_preds_reward - reward_returns[idx]).pow(2).mean()
+                v_loss.backward()
+                batch_value_loss = v_loss.item() * batch_size
+                
+                for cname in self.cfg.constraint_names:
+                    v_pred_c = v_preds[cname]
+                    v_loss_c = 0.5 * (v_pred_c - constraint_returns[cname][idx]).pow(2).mean()
+                    v_loss_c.backward()
+                    batch_value_loss += v_loss_c.item() * batch_size
+                
+                # Gradient clipping
                 all_params = list(self.policy.parameters()) + list(self.value_heads.parameters())
                 if self.encoder is not None:
                     all_params += list(self.encoder.parameters())
                 torch.nn.utils.clip_grad_norm_(all_params, max_norm=0.5)
-
+                
                 self.optimizer.step()
-
+                
                 with torch.no_grad():
                     effective_loss = (-batch_policy_surr + batch_constraint_pen) / batch_size
                     total_policy_loss += effective_loss

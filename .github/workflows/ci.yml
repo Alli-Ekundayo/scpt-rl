@@ -87,7 +87,6 @@ jobs:
     name: Integration (Rust wheel + full test suite)
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
     needs: [test-python, test-rust]
 
     steps:
@@ -152,7 +151,6 @@ jobs:
     name: Type check (pyright)
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    continue-on-error: true
 
     steps:
       - uses: actions/checkout@v4

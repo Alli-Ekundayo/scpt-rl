@@ -142,3 +142,29 @@ def test_encoder_unknown_node_type_raises():
         assert False, "should have raised"
     except KeyError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# _hash_float determinism (N7)
+# ---------------------------------------------------------------------------
+
+def test_hash_float_is_deterministic():
+    """N7 regression: _hash_float must return the same value across calls.
+
+    Python's built-in hash() is PYTHONHASHSEED-dependent, meaning it can differ
+    between processes.  The md5-based implementation must be stable so that
+    net-name features are identical between training and evaluation runs.
+    """
+    from scpt.model.gnn_encoder import _hash_float
+
+    net_names = ["VDD", "GND", "CLK_P", "CLK_N", "DATA_SDA", "", "N00001"]
+    for name in net_names:
+        v1 = _hash_float(name)
+        v2 = _hash_float(name)
+        assert v1 == v2, f"_hash_float not idempotent for '{name}': {v1} != {v2}"
+        assert 0.0 <= v1 <= 1.0, f"_hash_float out of [0,1] for '{name}': {v1}"
+
+    # Different strings should produce different hashes (collision-free for short list).
+    values = [_hash_float(n) for n in net_names if n]
+    # Allow at most 1 collision in this small set.
+    assert len(set(values)) >= len(values) - 1, "Too many hash collisions in test set"
