@@ -53,8 +53,10 @@ bc:
     - dataset/base_raw/voltage_datalogger_adc0.kicad_pcb
     - dataset/base_raw/ATMEGA328_Motor_Board.kicad_pcb
     - dataset/base_raw/Blixten.kicad_pcb
-    - dataset/base_raw/boatcontrol.kicad_pcb
     - dataset/base_raw/Driverino-Shield.kicad_pcb
+    # boatcontrol is a 535mm x 308mm motherboard with 659,120 grid cells and 683 components.
+    # Excluded from BC pretrain to prevent massive cross-entropy compute per epoch.
+    # - dataset/base_raw/boatcontrol.kicad_pcb
 
   epochs: 20
   lr: 3.0e-4

@@ -47,11 +47,13 @@ class SCPTPolicy(nn.Module):
         n_heads: int = 8,
         n_layers: int = 4,
         grid_spatial_dim: int = 2,
+        max_grid_chunk: int | None = 16384,
     ):
         super().__init__()
         self.d = d
         self.n_heads = n_heads
         self.n_layers = n_layers
+        self.max_grid_chunk = max_grid_chunk
 
         # Project query-side inputs to d.
         # z_star: (d,) per-component embedding of the active component.
@@ -127,11 +129,7 @@ class SCPTPolicy(nn.Module):
         B = z_star.shape[0]
         L = grid_xy.shape[1]
         P = Z_placed.shape[1]
-        
-        z_star_broadcast = z_star.unsqueeze(1).expand(B, L, -1)
-        query_input = torch.cat([z_star_broadcast, grid_xy], dim=-1)
-        Q = self.query_proj(query_input)
-        
+
         if P == 0:
             # Empty context: separate learnable K and V give the network the
             # ability to learn distinct first-step lookup-key vs. read-value
@@ -143,11 +141,36 @@ class SCPTPolicy(nn.Module):
             kv_input = torch.cat([Z_placed, F_pair], dim=-1)
             KV = self.kv_proj(kv_input)
             K, V = KV.split(self.d, dim=-1)
-        
+
+        # Chunk the grid dimension L if it exceeds max_grid_chunk to keep
+        # activation memory bounded on very large boards (e.g. L > 100k).
+        # Since queries attend only to placed components (K, V) and there is no
+        # inter-query self-attention, chunking along L is numerically exact.
+        if self.max_grid_chunk is not None and L > self.max_grid_chunk:
+            logits_chunks = []
+            for start in range(0, L, self.max_grid_chunk):
+                end = min(start + self.max_grid_chunk, L)
+                L_chunk = end - start
+                z_b = z_star.unsqueeze(1).expand(B, L_chunk, -1)
+                q_in = torch.cat([z_b, grid_xy[:, start:end]], dim=-1)
+                H_chunk = self.query_proj(q_in)
+                for layer in self.attn_layers:
+                    H_chunk = layer(H_chunk, K, V, kv_mask=kv_mask)
+                l_chunk = self.logit_head(H_chunk).squeeze(-1)
+                m_chunk = action_mask[:, start:end]
+                ill = m_chunk < 0.5
+                l_chunk = l_chunk.masked_fill(ill, float("-inf"))
+                logits_chunks.append(l_chunk)
+            return torch.cat(logits_chunks, dim=-1)
+
+        z_star_broadcast = z_star.unsqueeze(1).expand(B, L, -1)
+        query_input = torch.cat([z_star_broadcast, grid_xy], dim=-1)
+        Q = self.query_proj(query_input)
+
         H = Q
         for layer in self.attn_layers:
             H = layer(H, K, V, kv_mask=kv_mask)
-        
+
         logits = self.logit_head(H).squeeze(-1)
         illegal = action_mask < 0.5
         logits = logits.masked_fill(illegal, float("-inf"))
@@ -201,14 +224,18 @@ class _CrossAttentionLayer(nn.Module):
         K_r = self.k_proj(K).view(B, P, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
         V_r = self.v_proj(V).view(B, P, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
         
-        scale = math.sqrt(self.head_dim)
-        scores = torch.matmul(Q_r, K_r.transpose(-2, -1)) / scale
         if kv_mask is not None:
-            scores = scores.masked_fill(kv_mask[:, None, None, :], float("-inf"))
-        weights = F.softmax(scores, dim=-1)
-        # Handle NaN from all-masked rows (all -inf → softmax NaN)
-        weights = weights.nan_to_num(0.0)
-        attn_out = torch.matmul(weights, V_r)
+            # kv_mask is (B, P) bool where True = padding position to ignore.
+            # SDPA attn_mask takes (B, 1, 1, P) bool where False = mask out / ignore.
+            attn_mask = ~kv_mask[:, None, None, :]
+        else:
+            attn_mask = None
+
+        # Use PyTorch memory-efficient scaled dot-product attention (FlashAttention / Cutlass).
+        # This avoids materializing the full (B, heads, L, P) attention score matrix in memory,
+        # reducing peak attention memory from O(L * P) to O(L + P).
+        attn_out = F.scaled_dot_product_attention(Q_r, K_r, V_r, attn_mask=attn_mask)
+        attn_out = attn_out.nan_to_num(0.0)
         attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(B, L, self.d)
         attn_out = self.out_proj(attn_out)
         
