@@ -37,6 +37,16 @@ class EnvConfig:
     w_sym: float = 1.0
     decap_radius_mm: float = 2.0
     max_components: int = 10_000
+    # Reward shaping weight for the centroid-spread penalty.
+    # c_spread is in [0, 1] (0 = perfectly spread, 1 = point-mass).
+    # A weight of 0.1 adds a term of at most 0.1 to the magnitude of the
+    # per-step reward (which itself is O(−1) from HPWL / board_diag), so the
+    # scale is compatible without re-tuning LR or advantage normalisation.
+    # NOTE: c_spread is intentionally NOT a Lagrangian constraint — the AL
+    # framework's 1/(1−γ) amplification turns consistently-high per-step costs
+    # (c_spread ≈ 0.9 early in training) into phi_c values in the hundreds,
+    # blowing up the quadratic AL penalty past what clip_grad_norm can catch.
+    spread_shaping_weight: float = 0.1
 
 
 @dataclass
@@ -162,13 +172,23 @@ class PcbPlacementEnv(gym.Env):
                     "costs": costs, "infeasible": True,
                 }
 
-        # Reward = negative HPWL normalised by board diagonal.
+        # Reward signal.
+        #
+        # Primary: negative HPWL normalised by board diagonal.
         # Raw HPWL is in mm (O(500)–O(2000)); dividing by the board diagonal
-        # brings the reward to O(−10), commensurate with normalised advantages.
-        # Constraint costs (clearance, partition) are handled exclusively
-        # by the PPO-EAL Lagrangian — not subtracted from reward.
+        # brings the reward to O(−1), commensurate with normalised advantages.
+        #
+        # Shaping: subtract a spread penalty (c_spread ∈ [0,1]) scaled by
+        # spread_shaping_weight (default 0.1).  This counters the HPWL-collapse
+        # failure mode where the policy learns to stack everything at one corner.
+        # c_spread is NOT a Lagrangian constraint — see EnvConfig.spread_shaping_weight
+        # for the full reasoning.  Constraint costs (clearance, partition) are
+        # handled exclusively by the PPO-EAL Lagrangian — not subtracted here.
         board_diag = math.sqrt(bounds["w"] ** 2 + bounds["h"] ** 2)
-        reward = -costs.get("c_hpwl", 0.0) / max(board_diag, 1.0)
+        reward = (
+            -costs.get("c_hpwl", 0.0) / max(board_diag, 1.0)
+            - self.cfg.spread_shaping_weight * costs.get("c_spread", 0.0)
+        )
 
         terminated = st.placed_count == len(st.placement_order)
         return self._build_obs(), reward, terminated, False, {"costs": costs}
@@ -212,10 +232,11 @@ class PcbPlacementEnv(gym.Env):
           ``normalised_spread = (std_x + std_y) / board_diagonal``.
           Value 0 = perfectly spread (good); value 1 = all components at
           exactly the same point (worst case).  Only meaningful once ≥ 2
-          components are placed; returns 1.0 on the first step so the
-          Lagrangian pressure is active from step 1.
-          Budget ``b_spread`` should be set to something small (e.g. 0.3)
-          so the constraint fires once clustering gets bad.
+          Value 0 = perfectly spread (good); value 1 = all components at
+          exactly the same point (worst case).  Only meaningful once ≥ 2
+          components are placed; returns 0.0 on the first step (nothing to
+          measure yet).  Used as a **reward shaping term** (not a Lagrangian
+          constraint) — see ``EnvConfig.spread_shaping_weight``.
           No Rust call needed — pure Python over the positions dict.
         """
         if bounds is None:
@@ -241,9 +262,8 @@ class PcbPlacementEnv(gym.Env):
             ) / max(board_diag, 1.0)
             c_spread = max(0.0, 1.0 - spread)
         else:
-            # First placement step: no spread computable, set to worst case
-            # so the Lagrangian starts applying pressure immediately.
-            c_spread = 1.0
+            # Only one component placed — spread is undefined; no penalty yet.
+            c_spread = 0.0
 
         return {
             # Dimensionless: overlap_area_mm2 / board_area_mm2.

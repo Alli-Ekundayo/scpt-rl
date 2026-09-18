@@ -79,12 +79,10 @@ ppo:
   constraint_names:
     - c_clearance
     - c_partition
-    - c_spread
 
   constraint_budgets:
     c_clearance: 0.0
     c_partition: 1.15
-    c_spread: 0.3
 
   dual_alpha: 0.01
   dual_ema_decay: 0.9
