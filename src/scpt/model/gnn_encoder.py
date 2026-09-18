@@ -27,7 +27,6 @@ import torch
 import torch.nn as nn
 
 from scpt.training.data import build_pair_features
-from scpt.utils import polygon_area
 
 
 class HeteroPCBEncoder(nn.Module):
@@ -82,7 +81,11 @@ def build_node_features(
     """Build per-node-type feature tensors from a SCPT PcbDesign dict.
 
     v1 features:
-    - component: placed flag (1), courtyard area, pad count, current x/y if placed (else 0/0).
+    - component: placed flag (1), courtyard half_w (1), courtyard half_h (1),
+      pad count (1), current x/y if placed else 0/0 (2) → 6 dims total.
+      Using explicit half-extents instead of a scalar area lets the network
+      distinguish aspect ratio (a 10mm×1mm strip vs a 3.2mm×3.2mm square can
+      have the same area but need very different neighbourhood contexts).
     - pad: local position (2), net_name hash (1 float), electrical_proxy_confidence (1).
     - net: role one-hot (4: signal/power/ground/unknown), pad count, role_confidence.
 
@@ -103,7 +106,14 @@ def build_node_features(
     total_pads = 0
     for i, comp in enumerate(components):
         placed = positions[i] is not None if i < len(positions) else False
-        courtyard_area = polygon_area(comp.get("footprint", {}).get("courtyard", {}).get("points", []))
+        courtyard_pts = comp.get("footprint", {}).get("courtyard", {}).get("points", [])
+        if courtyard_pts:
+            cxs = [pt[0] for pt in courtyard_pts]
+            cys = [pt[1] for pt in courtyard_pts]
+            half_w = (max(cxs) - min(cxs)) / 2.0
+            half_h = (max(cys) - min(cys)) / 2.0
+        else:
+            half_w = half_h = 0.0
         pads = comp.get("footprint", {}).get("pads", [])
         n_pads = len(pads)
         total_pads += n_pads
@@ -111,8 +121,9 @@ def build_node_features(
             x, y = positions[i]["position"]
         else:
             x, y = 0.0, 0.0
-        comp_feats.append([1.0 if placed else 0.0, courtyard_area, float(n_pads), x, y])
-    comp_tensor = torch.tensor(comp_feats, dtype=torch.float32) if comp_feats else torch.zeros((0, 5))
+        # 6-dim: placed_flag, half_w, half_h, n_pads, x, y
+        comp_feats.append([1.0 if placed else 0.0, half_w, half_h, float(n_pads), x, y])
+    comp_tensor = torch.tensor(comp_feats, dtype=torch.float32) if comp_feats else torch.zeros((0, 6))
 
     # --- Pad features ---
     # Flatten across all components. Each pad has: local_pos (2),

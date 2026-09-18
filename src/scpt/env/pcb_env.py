@@ -207,19 +207,44 @@ class PcbPlacementEnv(gym.Env):
           for a clean one — commensurate with the reward signal.
         * ``c_hpwl``: raw HPWL is in mm (O(500)–O(2000)).  Normalisation
           happens in ``step()`` where it enters the reward.
-        * ``c_partition``: **placeholder — always 0.0 in v1.**  The partition-
-          cut cost will be exposed by ``pcb_parser.partition_cut`` in a future
-          Rust release.  Until then the constraint critic for ``c_partition``
-          trains on identically-zero cost signal and its λ stays near zero.
-          Remove ``c_partition`` from ``constraint_names`` in the config if
-          you want to skip the phantom constraint entirely.
+        * ``c_spread``: measures how clustered the placed components are.
+          It equals ``max(0, 1 - normalised_spread)``, where
+          ``normalised_spread = (std_x + std_y) / board_diagonal``.
+          Value 0 = perfectly spread (good); value 1 = all components at
+          exactly the same point (worst case).  Only meaningful once ≥ 2
+          components are placed; returns 1.0 on the first step so the
+          Lagrangian pressure is active from step 1.
+          Budget ``b_spread`` should be set to something small (e.g. 0.3)
+          so the constraint fires once clustering gets bad.
+          No Rust call needed — pure Python over the positions dict.
         """
         if bounds is None:
             bounds = self.state.design["board"]["bounds"]
         board_area = bounds["w"] * bounds["h"]
+        board_diag = math.sqrt(bounds["w"] ** 2 + bounds["h"] ** 2)
         raw_clearance = pcb_parser.clearance_cost(
             self.state.design_json, self.cfg.min_spacing_mm
         )
+
+        # Centroid spread: std of placed component x- and y-positions,
+        # normalised by the board diagonal so it is in [0, 1].
+        placed_positions = [
+            p["position"]
+            for p in self.state.design["placement"]["positions"]
+            if p is not None
+        ]
+        if len(placed_positions) >= 2:
+            xs = [p[0] for p in placed_positions]
+            ys = [p[1] for p in placed_positions]
+            spread = (
+                float(np.std(xs)) + float(np.std(ys))
+            ) / max(board_diag, 1.0)
+            c_spread = max(0.0, 1.0 - spread)
+        else:
+            # First placement step: no spread computable, set to worst case
+            # so the Lagrangian starts applying pressure immediately.
+            c_spread = 1.0
+
         return {
             # Dimensionless: overlap_area_mm2 / board_area_mm2.
             "c_clearance": raw_clearance / max(board_area, 1.0),
@@ -227,6 +252,8 @@ class PcbPlacementEnv(gym.Env):
             # v1: partition cut not exposed yet — always 0.0; see docstring above.
             "c_partition": 0.0,
             "b_partition": 1.15 * self.cfg.expert_cut_cost,
+            # Centroid clustering penalty: 0 = spread, 1 = all at one point.
+            "c_spread": c_spread,
             # v1: Tier 2 sub-scores not exposed yet via PyO3 — use 0.
             "r_tier2": 0.0,
         }
@@ -250,6 +277,53 @@ class PcbPlacementEnv(gym.Env):
             else 0
         )
         active_comp_idx = self.state.placement_order[active_order_idx]
+
+        # ------------------------------------------------------------------ #
+        # Guard 1: active component's own footprint vs. board boundary.       #
+        #                                                                      #
+        # Previously _compute_mask only zeroed cells occupied/obstructed by   #
+        # *already-placed* components; it never checked whether centering the  #
+        # *active* component at a given cell would push its courtyard extent   #
+        # past a board edge.  Fix: compute the active component's half-extents #
+        # (same formula used in the placed-component loop below) and zero out  #
+        # the border band of cells where placement would violate the physical  #
+        # board boundary.                                                       #
+        #                                                                      #
+        # margin_cells is included so the exclusion matches the DRC clearance  #
+        # enforced between placed components.  If you want footprint-edge-only #
+        # (no clearance), replace `+ margin_cells` with nothing here.         #
+        #                                                                      #
+        # NOTE: This narrows the legal action set for every component.        #
+        # Resuming an existing checkpoint into this stricter mask will cause   #
+        # a value-estimate shock similar to a mid-training distribution shift; #
+        # a fresh training run (or at minimum a fresh BC phase) is recommended.#
+        # ------------------------------------------------------------------ #
+        active_comp = self.state.design["components"][active_comp_idx]
+        active_courtyard_pts = (
+            active_comp.get("footprint", {}).get("courtyard", {}).get("points", [])
+        )
+        if active_courtyard_pts:
+            axs = [pt[0] for pt in active_courtyard_pts]
+            ays = [pt[1] for pt in active_courtyard_pts]
+            a_half_w = (
+                max(1, int(math.ceil((max(axs) - min(axs)) / (2.0 * res))))
+                + margin_cells
+            )
+            a_half_h = (
+                max(1, int(math.ceil((max(ays) - min(ays)) / (2.0 * res))))
+                + margin_cells
+            )
+        else:
+            # Fallback mirrors the placed-component fallback (2-cell radius).
+            a_half_w = 2 + margin_cells
+            a_half_h = 2 + margin_cells
+
+        # Zero out the border band — any center in this region would put the
+        # component's extent (or its clearance margin) off the physical board.
+        mask_2d[:a_half_h, :] = 0.0
+        mask_2d[self.H - a_half_h :, :] = 0.0
+        mask_2d[:, :a_half_w] = 0.0
+        mask_2d[:, self.W - a_half_w :] = 0.0
 
         for i, p in enumerate(self.state.design["placement"]["positions"]):
             if p is None or i == active_comp_idx:

@@ -100,3 +100,65 @@ def test_custom_max_components():
     assert env.observation_space["placed_comp_indices"].shape == (50,)
     assert obs["placed_comp_indices"].shape == (50,)
 
+
+def test_mask_forbids_board_edge_placements():
+    """Legal cells must not push the active component's courtyard off the board.
+
+    Directly exercises the Guard-1 boundary fix in ``_compute_mask``.  For
+    every cell the mask marks as legal we assert that its (row, col) index is
+    at least ``a_half_{h,w}`` away from each board edge, where those values
+    mirror the exclusion band the new guard zeroes out.
+
+    The fixture has no courtyard polygons so the fallback path (2 + margin)
+    is exercised.  The 100mm / 0.5mm = 200×200 grid is large enough that a
+    3-cell border should still leave legal cells inside.  If the mask is
+    all-zero (every cell blocked by already-placed components) the test skips
+    rather than giving a false pass.
+    """
+    import math
+
+    env = PcbPlacementEnv(FIXTURE)
+    obs, _ = env.reset(seed=42)
+
+    mask = obs["action_mask"]
+    legal_flat = (mask > 0).nonzero()[0]
+    if len(legal_flat) == 0:
+        pytest.skip("no legal actions in fixture — boundary test not applicable")
+
+    # Reproduce the half-extents the same way _compute_mask does.
+    st = env.state
+    active_order_idx = st.step_idx if st.step_idx < len(st.placement_order) else 0
+    active_comp_idx = st.placement_order[active_order_idx]
+    active_comp = st.design["components"][active_comp_idx]
+    active_cyd_pts = (
+        active_comp.get("footprint", {}).get("courtyard", {}).get("points", [])
+    )
+    res = env.cfg.grid_resolution_mm
+    margin = max(1, int(math.ceil(env.cfg.min_spacing_mm / res)))
+
+    if active_cyd_pts:
+        axs = [pt[0] for pt in active_cyd_pts]
+        ays = [pt[1] for pt in active_cyd_pts]
+        a_half_w = (
+            max(1, int(math.ceil((max(axs) - min(axs)) / (2.0 * res)))) + margin
+        )
+        a_half_h = (
+            max(1, int(math.ceil((max(ays) - min(ays)) / (2.0 * res)))) + margin
+        )
+    else:
+        a_half_w = a_half_h = 2 + margin
+
+    rows, cols = np.unravel_index(legal_flat, (env.H, env.W))
+
+    assert (rows >= a_half_h).all(), (
+        f"Legal cell(s) within {a_half_h} rows of top edge — boundary guard broken."
+    )
+    assert (rows < env.H - a_half_h).all(), (
+        f"Legal cell(s) within {a_half_h} rows of bottom edge."
+    )
+    assert (cols >= a_half_w).all(), (
+        f"Legal cell(s) within {a_half_w} cols of left edge."
+    )
+    assert (cols < env.W - a_half_w).all(), (
+        f"Legal cell(s) within {a_half_w} cols of right edge."
+    )

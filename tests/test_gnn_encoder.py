@@ -68,7 +68,7 @@ def test_build_features_shape():
     assert "component" in feats
     assert "pad" in feats
     assert "net" in feats
-    assert feats["component"].shape == (2, 5)
+    assert feats["component"].shape == (2, 6)
     assert feats["pad"].shape == (4, 4)
     assert feats["net"].shape == (2, 6)
 
@@ -103,7 +103,7 @@ def test_net_features_role_onehot():
 def test_empty_design():
     d = {"components": [], "nets": [], "placement": {"positions": []}}
     feats = build_node_features(d)
-    assert feats["component"].shape == (0, 5)
+    assert feats["component"].shape == (0, 6)
     assert feats["pad"].shape == (0, 4)
     assert feats["net"].shape == (0, 6)
 
@@ -113,7 +113,7 @@ def test_empty_design():
 # ---------------------------------------------------------------------------
 
 def test_encoder_output_shapes():
-    enc = HeteroPCBEncoder(node_dims={"component": 5, "pad": 4, "net": 6}, hidden=32)
+    enc = HeteroPCBEncoder(node_dims={"component": 6, "pad": 4, "net": 6}, hidden=32)
     feats = build_node_features(_make_design())
     out = enc(feats)
     assert out["component"].shape == (2, 32)

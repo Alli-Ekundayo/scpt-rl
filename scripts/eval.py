@@ -82,7 +82,7 @@ def _build_and_load(ckpt_path: str, cfg: SimpleNamespace):
 
     device = _select_device()
     encoder = HeteroPCBEncoder(
-        node_dims={"component": 5, "pad": 4, "net": 6},
+        node_dims={"component": 6, "pad": 4, "net": 6},
         hidden=model_d,
     ).to(device)
     policy = SCPTPolicy(d=model_d, pair_dim=model_pair_dim, n_heads=model_n_heads, n_layers=model_n_layers).to(device)

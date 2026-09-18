@@ -607,7 +607,7 @@ def main(argv: list[str] | None = None) -> None:
         if "encoder_state" in ckpt and ckpt["encoder_state"] is not None:
             from scpt.model.gnn_encoder import HeteroPCBEncoder
             encoder = HeteroPCBEncoder(
-                node_dims={"component": 5, "pad": 4, "net": 6},
+                node_dims={"component": 6, "pad": 4, "net": 6},
                 hidden=model_d,
             )
             encoder.load_state_dict(ckpt["encoder_state"])

@@ -239,7 +239,7 @@ def _run_policy_rollout(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     encoder = HeteroPCBEncoder(
-        node_dims={"component": 5, "pad": 4, "net": 6}, hidden=model_d
+        node_dims={"component": 6, "pad": 4, "net": 6}, hidden=model_d
     ).to(device)
     policy = SCPTPolicy(
         d=model_d, pair_dim=model_pair, n_heads=model_heads, n_layers=model_layers

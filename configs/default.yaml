@@ -64,11 +64,14 @@ ppo:
     - c_hpwl
     - c_clearance
     - c_partition
+    - c_spread
 
   constraint_budgets:
     c_hpwl: 500.0             # allowed HPWL cost per episode (mm · net-count)
     c_clearance: 0.0          # clearance cost budget (0 = no violation allowed)
     c_partition: 1.15         # ≤ 1.15× the expert partition-cut cost
+    c_spread: 0.3             # clustering budget: 0 = perfectly spread, 1 = point-mass
+                              # 0.3 fires once std/(board_diag) < 0.7
 
   # Dual ascent
   dual_alpha: 0.01            # λ ascent step size

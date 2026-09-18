@@ -60,7 +60,7 @@ def build_models(cfg: SimpleNamespace):
     from scpt.model.value_heads import ValueHeads
 
     encoder = HeteroPCBEncoder(
-        node_dims={"component": 5, "pad": 4, "net": 6},
+        node_dims={"component": 6, "pad": 4, "net": 6},
         hidden=cfg.model.d,
     )
     policy = SCPTPolicy(

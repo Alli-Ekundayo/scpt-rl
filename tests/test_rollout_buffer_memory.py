@@ -13,7 +13,7 @@ from scpt.model.value_heads import ValueHeads
 
 def test_old_format_compatibility():
     """Trainer handles precomputed tensors (legacy format)."""
-    encoder = HeteroPCBEncoder({"component": 5, "pad": 4, "net": 6}, hidden=16)
+    encoder = HeteroPCBEncoder({"component": 6, "pad": 4, "net": 6}, hidden=16)
     policy = SCPTPolicy(d=16, pair_dim=8, n_heads=2, n_layers=2)
     value_heads = ValueHeads(d=16, constraint_names=["c_test"])
 
@@ -52,7 +52,7 @@ def test_old_format_compatibility():
 
 def test_reconstruction_format_compatibility():
     """Trainer handles compact reconstruction format."""
-    encoder = HeteroPCBEncoder({"component": 5, "pad": 4, "net": 6}, hidden=16)
+    encoder = HeteroPCBEncoder({"component": 6, "pad": 4, "net": 6}, hidden=16)
     policy = SCPTPolicy(d=16, pair_dim=8, n_heads=2, n_layers=2)
     value_heads = ValueHeads(d=16, constraint_names=["c_test"])
 
