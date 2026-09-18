@@ -372,7 +372,12 @@ class PPOEALTrainer:
         z_star, Z_placed, F_pair, grid_xy, action_mask = self._get_policy_inputs(obs)
 
         logits = self.policy(z_star, Z_placed, F_pair, grid_xy, action_mask)
-        dist = torch.distributions.Categorical(logits=logits)
+        if torch.isneginf(logits).all():
+            # Infeasible state: all actions masked to -inf.
+            # Avoid Categorical([-inf, ...]) which produces 0/0 = NaN.
+            dist = torch.distributions.Categorical(logits=torch.zeros_like(logits))
+        else:
+            dist = torch.distributions.Categorical(logits=logits)
         action = dist.sample()
         return int(action.item()), dist.log_prob(action)
 
@@ -802,6 +807,9 @@ class PPOEALTrainer:
                 # ---- Batched policy forward ----
                 logits = self.policy(z_star_batch, Z_placed_batch, F_pair_batch, 
                                      grid_xy_batch, mask_batch, kv_mask=kv_mask_batch)
+                if torch.isneginf(logits).all(dim=-1).any():
+                    infeasible_rows = torch.isneginf(logits).all(dim=-1, keepdim=True)
+                    logits = torch.where(infeasible_rows, torch.zeros_like(logits), logits)
                 dist = torch.distributions.Categorical(logits=logits)
                 lps = dist.log_prob(actions_batch)
                 

@@ -152,11 +152,10 @@ pub fn build_board_output(
     nets.sort_by_key(|n| n.id);
 
     // Build board geometry
-    let (outline_polygon, outline_bbox) = extract_board_outline(&raw_pcb.edge_cuts_segments);
+    let (mut outline_polygon, mut bounding_box) = extract_board_outline(&raw_pcb.edge_cuts_segments);
 
-    // Compute overall bounding box from outline or from components
-    let bounding_box = if outline_polygon.is_empty() {
-        // Fall back to component bounding boxes
+    // If outline polygon is empty or degenerate (zero width or height), fall back to components
+    if outline_polygon.len() < 3 || bounding_box.max_x <= bounding_box.min_x || bounding_box.max_y <= bounding_box.min_y {
         let all_pts: Vec<Point2D> = components
             .iter()
             .flat_map(|c| {
@@ -166,10 +165,18 @@ pub fn build_board_output(
                 ]
             })
             .collect();
-        crate::geometry::compute_bounding_box(&all_pts)
-    } else {
-        outline_bbox
-    };
+        let comp_bbox = crate::geometry::compute_bounding_box(&all_pts);
+        if comp_bbox.max_x > comp_bbox.min_x && comp_bbox.max_y > comp_bbox.min_y {
+            bounding_box = comp_bbox;
+            outline_polygon = vec![
+                Point2D { x: bounding_box.min_x, y: bounding_box.min_y },
+                Point2D { x: bounding_box.max_x, y: bounding_box.min_y },
+                Point2D { x: bounding_box.max_x, y: bounding_box.max_y },
+                Point2D { x: bounding_box.min_x, y: bounding_box.max_y },
+                Point2D { x: bounding_box.min_x, y: bounding_box.min_y },
+            ];
+        }
+    }
 
     BoardOutput {
         metadata: BoardMetadata {

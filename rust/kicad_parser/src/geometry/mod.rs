@@ -14,7 +14,7 @@ use geo::{LineString, Polygon as GeoPolygon};
 const ARC_INTERPOLATION_STEPS: usize = 24;
 
 /// Tolerance for matching segment endpoints during outline chaining (mm).
-const CHAIN_SNAP_TOLERANCE: f64 = 0.01;
+const CHAIN_SNAP_TOLERANCE: f64 = 0.05;
 
 /// Rotates a point around origin (0,0) by `rotation_deg` degrees.
 pub fn rotate_point(pt: &Point2D, rotation_deg: f64) -> Point2D {
@@ -130,18 +130,49 @@ pub fn extract_board_outline(segments: &[EdgeCutSegment]) -> (Vec<Point2D>, Boun
     // Step 2: Chain polylines end-to-end
     let contours = chain_polylines(&polylines);
 
-    // Step 3: Pick the longest contour (most points = likely the board outline)
+    // Step 3: Pick the contour with largest area (bounding box area, with point count as tie-breaker)
     let best = contours
         .into_iter()
-        .max_by_key(|c| c.len())
+        .max_by(|a, b| {
+            let area_a = {
+                let bb = compute_bounding_box(a);
+                (bb.max_x - bb.min_x).max(0.0) * (bb.max_y - bb.min_y).max(0.0)
+            };
+            let area_b = {
+                let bb = compute_bounding_box(b);
+                (bb.max_x - bb.min_x).max(0.0) * (bb.max_y - bb.min_y).max(0.0)
+            };
+            area_a
+                .partial_cmp(&area_b)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.len().cmp(&b.len()))
+        })
         .unwrap_or_default();
 
     let bbox = compute_bounding_box(&best);
+
+    // If the best contour is degenerate (< 3 points or 0 width/height),
+    // compute bounding box from all polylines and construct a rectangular contour.
+    if (best.len() < 3 || bbox.max_x <= bbox.min_x || bbox.max_y <= bbox.min_y) && !polylines.is_empty() {
+        let all_pts: Vec<Point2D> = polylines.into_iter().flatten().collect();
+        let fallback_bbox = compute_bounding_box(&all_pts);
+        if fallback_bbox.max_x > fallback_bbox.min_x && fallback_bbox.max_y > fallback_bbox.min_y {
+            let rect_poly = vec![
+                Point2D { x: fallback_bbox.min_x, y: fallback_bbox.min_y },
+                Point2D { x: fallback_bbox.max_x, y: fallback_bbox.min_y },
+                Point2D { x: fallback_bbox.max_x, y: fallback_bbox.max_y },
+                Point2D { x: fallback_bbox.min_x, y: fallback_bbox.max_y },
+                Point2D { x: fallback_bbox.min_x, y: fallback_bbox.min_y },
+            ];
+            return (rect_poly, fallback_bbox);
+        }
+    }
+
     (best, bbox)
 }
 
 /// Converts an EdgeCutSegment to an ordered polyline.
-fn segment_to_polyline(seg: &EdgeCutSegment) -> Vec<Point2D> {
+pub fn segment_to_polyline(seg: &EdgeCutSegment) -> Vec<Point2D> {
     match seg {
         EdgeCutSegment::Line { start, end } => {
             vec![*start, *end]
@@ -253,8 +284,10 @@ fn angle_in_range(angle: f64, start: f64, sweep_end: f64) -> bool {
 
 /// Chains polyline segments end-to-end into closed contours.
 ///
-/// Uses a greedy nearest-endpoint approach: for each chain, find the unvisited
-/// segment whose start is closest to the current chain's end (within snap tolerance).
+/// Uses a greedy nearest-endpoint approach with bidirectional matching:
+/// connects to either start or end of unvisited segments (reversing if needed),
+/// and extends both forward and backward to guarantee complete contours even when
+/// CAD lines are drawn with arbitrary orientations.
 fn chain_polylines(polylines: &[Vec<Point2D>]) -> Vec<Vec<Point2D>> {
     if polylines.is_empty() {
         return Vec::new();
@@ -265,39 +298,93 @@ fn chain_polylines(polylines: &[Vec<Point2D>]) -> Vec<Vec<Point2D>> {
     let mut contours = Vec::new();
 
     for start_idx in 0..n {
-        if used[start_idx] {
+        if used[start_idx] || polylines[start_idx].is_empty() {
             continue;
         }
 
         let mut chain = polylines[start_idx].clone();
         used[start_idx] = true;
 
-        // Greedily extend the chain
+        // Greedily extend the chain at the back (chain_end)
         let mut changed = true;
         while changed {
             changed = false;
             let chain_end = *chain.last().unwrap();
 
-            // Find best next segment whose start matches chain_end
             let mut best_idx = None;
             let mut best_dist = CHAIN_SNAP_TOLERANCE;
+            let mut reverse_seg = false;
 
             for (i, pl) in polylines.iter().enumerate() {
                 if used[i] || pl.is_empty() {
                     continue;
                 }
-                let dist = chain_end.distance_to(&pl[0]);
-                if dist < best_dist {
-                    best_dist = dist;
+                let dist_start = chain_end.distance_to(&pl[0]);
+                if dist_start < best_dist {
+                    best_dist = dist_start;
                     best_idx = Some(i);
+                    reverse_seg = false;
+                }
+                let dist_end = chain_end.distance_to(pl.last().unwrap());
+                if dist_end < best_dist {
+                    best_dist = dist_end;
+                    best_idx = Some(i);
+                    reverse_seg = true;
                 }
             }
 
             if let Some(idx) = best_idx {
                 used[idx] = true;
-                // Append the new polyline, skipping the first point (it duplicates chain_end)
-                chain.extend(polylines[idx].iter().skip(1));
+                let mut seg = polylines[idx].clone();
+                if reverse_seg {
+                    seg.reverse();
+                }
+                chain.extend(seg.into_iter().skip(1));
                 changed = true;
+            }
+        }
+
+        // Greedily extend the chain at the front if not closed
+        if chain.len() >= 2 && chain.first().unwrap().distance_to(chain.last().unwrap()) > CHAIN_SNAP_TOLERANCE {
+            let mut changed_front = true;
+            while changed_front {
+                changed_front = false;
+                let chain_start = chain[0];
+
+                let mut best_idx = None;
+                let mut best_dist = CHAIN_SNAP_TOLERANCE;
+                let mut attach_end = true;
+
+                for (i, pl) in polylines.iter().enumerate() {
+                    if used[i] || pl.is_empty() {
+                        continue;
+                    }
+                    let dist_end = chain_start.distance_to(pl.last().unwrap());
+                    if dist_end < best_dist {
+                        best_dist = dist_end;
+                        best_idx = Some(i);
+                        attach_end = true;
+                    }
+                    let dist_start = chain_start.distance_to(&pl[0]);
+                    if dist_start < best_dist {
+                        best_dist = dist_start;
+                        best_idx = Some(i);
+                        attach_end = false;
+                    }
+                }
+
+                if let Some(idx) = best_idx {
+                    used[idx] = true;
+                    let mut seg = polylines[idx].clone();
+                    if !attach_end {
+                        seg.reverse();
+                    }
+                    let mut new_chain = seg;
+                    new_chain.pop(); // remove duplicate matching endpoint
+                    new_chain.extend(chain);
+                    chain = new_chain;
+                    changed_front = true;
+                }
             }
         }
 

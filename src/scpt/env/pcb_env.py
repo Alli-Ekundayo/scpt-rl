@@ -81,6 +81,17 @@ class PcbPlacementEnv(gym.Env):
 
         # Compute grid dims from board bounds.
         bounds = initial["board"]["bounds"]
+        if bounds["w"] <= 0.0 or bounds["h"] <= 0.0:
+            outline_pts = initial.get("board", {}).get("outline", {}).get("points", [])
+            if len(outline_pts) >= 2:
+                xs = [p[0] for p in outline_pts]
+                ys = [p[1] for p in outline_pts]
+                min_x, max_x = min(xs), max(xs)
+                min_y, max_y = min(ys), max(ys)
+                if max_x > min_x and max_y > min_y:
+                    bounds = {"x": min_x, "y": min_y, "w": max_x - min_x, "h": max_y - min_y}
+                    initial["board"]["bounds"] = bounds
+                    self._initial_json = json.dumps(initial)
         self.W = max(1, int(bounds["w"] / self.cfg.grid_resolution_mm))
         self.H = max(1, int(bounds["h"] / self.cfg.grid_resolution_mm))
         self.action_space = gym.spaces.Discrete(self.H * self.W)
