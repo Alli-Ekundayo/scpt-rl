@@ -150,3 +150,40 @@ def test_load_legacy_state_dict_with_empty_context():
     assert torch.allclose(pol.empty_context_v, legacy_tensor)
 
 
+def test_forward_chunking_equivalence():
+    """Verify that chunked forward pass produces identical logits and gradients to unchunked."""
+    torch.manual_seed(42)
+    pol_unchunked = SCPTPolicy(d=32, pair_dim=14, n_heads=2, n_layers=1, max_query_tokens=None)
+    pol_chunked = SCPTPolicy(d=32, pair_dim=14, n_heads=2, n_layers=1, max_query_tokens=64)
+    pol_chunked.load_state_dict(pol_unchunked.state_dict())
+
+    B, L, P = 4, 100, 3
+    z_star = torch.randn(B, 32)
+    Z_placed = torch.randn(B, P, 32)
+    F_pair = torch.randn(B, P, 14)
+    grid_xy = torch.randn(B, L, 2)
+    mask = torch.ones(B, L)
+    mask[:, 10:20] = 0.0
+
+    logits_u = pol_unchunked(z_star, Z_placed, F_pair, grid_xy, mask)
+    logits_c = pol_chunked(z_star, Z_placed, F_pair, grid_xy, mask)
+
+    # Valid positions must match to within floating-point tolerance.
+    valid = mask > 0.5
+    assert torch.allclose(logits_u[valid], logits_c[valid], atol=1e-5)
+    # Masked positions must both be -inf
+    assert torch.isneginf(logits_u[~valid]).all()
+    assert torch.isneginf(logits_c[~valid]).all()
+
+    # Verify gradients match
+    loss_u = torch.where(valid, logits_u, torch.zeros_like(logits_u)).sum()
+    loss_c = torch.where(valid, logits_c, torch.zeros_like(logits_c)).sum()
+    loss_u.backward()
+    loss_c.backward()
+
+    for p_u, p_c in zip(pol_unchunked.parameters(), pol_chunked.parameters()):
+        if p_u.grad is not None:
+            assert torch.allclose(p_u.grad, p_c.grad, atol=1e-4)
+
+
+

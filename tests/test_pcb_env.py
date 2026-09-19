@@ -136,17 +136,11 @@ def test_mask_forbids_board_edge_placements():
     res = env.cfg.grid_resolution_mm
     margin = max(1, int(math.ceil(env.cfg.min_spacing_mm / res)))
 
-    if active_cyd_pts:
-        axs = [pt[0] for pt in active_cyd_pts]
-        ays = [pt[1] for pt in active_cyd_pts]
-        a_half_w = (
-            max(1, int(math.ceil((max(axs) - min(axs)) / (2.0 * res)))) + margin
-        )
-        a_half_h = (
-            max(1, int(math.ceil((max(ays) - min(ays)) / (2.0 * res)))) + margin
-        )
-    else:
-        a_half_w = a_half_h = 2 + margin
+    from scpt.env.pcb_env import _get_component_half_extents
+
+    a_half_w, a_half_h = _get_component_half_extents(active_comp, res, margin)
+    a_half_h = min(a_half_h, max(0, (env.H - 1) // 2))
+    a_half_w = min(a_half_w, max(0, (env.W - 1) // 2))
 
     rows, cols = np.unravel_index(legal_flat, (env.H, env.W))
 

@@ -68,6 +68,7 @@ def build_models(cfg: SimpleNamespace):
         pair_dim=cfg.model.pair_dim,
         n_heads=cfg.model.n_heads,
         n_layers=cfg.model.n_layers,
+        max_query_tokens=getattr(cfg.model, "max_query_tokens", 4096),
     )
     value_heads = ValueHeads(
         d=cfg.model.d,

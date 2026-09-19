@@ -47,13 +47,14 @@ class SCPTPolicy(nn.Module):
         n_heads: int = 8,
         n_layers: int = 4,
         grid_spatial_dim: int = 2,
-        max_grid_chunk: int | None = 16384,
+        max_query_tokens: int | None = 4096,
+        max_grid_chunk: int | None = None,
     ):
         super().__init__()
         self.d = d
         self.n_heads = n_heads
         self.n_layers = n_layers
-        self.max_grid_chunk = max_grid_chunk
+        self.max_query_tokens = max_grid_chunk if max_grid_chunk is not None else max_query_tokens
 
         # Project query-side inputs to d.
         # z_star: (d,) per-component embedding of the active component.
@@ -142,14 +143,17 @@ class SCPTPolicy(nn.Module):
             KV = self.kv_proj(kv_input)
             K, V = KV.split(self.d, dim=-1)
 
-        # Chunk the grid dimension L if it exceeds max_grid_chunk to keep
-        # activation memory bounded on very large boards (e.g. L > 100k).
-        # Since queries attend only to placed components (K, V) and there is no
-        # inter-query self-attention, chunking along L is numerically exact.
-        if self.max_grid_chunk is not None and L > self.max_grid_chunk:
+        # Chunk along L if total query tokens (B * L) exceeds max_query_tokens.
+        # This bounds activation memory during both single-board rollout (B=1)
+        # and batched PPO / BC training (e.g. B=32), preventing multi-gigabyte
+        # allocations in the FFN layers.
+        # Because queries only cross-attend to placed components (K, V) and have
+        # no inter-query self-attention, chunking along L is numerically exact.
+        if self.max_query_tokens is not None and (B * L) > self.max_query_tokens:
+            chunk_L = max(1, self.max_query_tokens // B)
             logits_chunks = []
-            for start in range(0, L, self.max_grid_chunk):
-                end = min(start + self.max_grid_chunk, L)
+            for start in range(0, L, chunk_L):
+                end = min(start + chunk_L, L)
                 L_chunk = end - start
                 z_b = z_star.unsqueeze(1).expand(B, L_chunk, -1)
                 q_in = torch.cat([z_b, grid_xy[:, start:end]], dim=-1)

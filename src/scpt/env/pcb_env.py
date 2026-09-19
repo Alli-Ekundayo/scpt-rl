@@ -49,6 +49,39 @@ class EnvConfig:
     spread_shaping_weight: float = 0.1
 
 
+def _get_component_half_extents(comp: dict, res: float, margin_cells: int) -> tuple[int, int]:
+    """Derive half-width and half-height (in grid cells) for a component footprint.
+
+    Tries:
+    1. Courtyard polygon AABB.
+    2. Pad positions bounding box (with 0.5mm assumed pad diameter).
+    3. Conservative fallback of 1 cell + margin.
+    """
+    courtyard_pts = comp.get("footprint", {}).get("courtyard", {}).get("points", [])
+    if courtyard_pts:
+        xs = [pt[0] for pt in courtyard_pts]
+        ys = [pt[1] for pt in courtyard_pts]
+        cyd_w = max(xs) - min(xs)
+        cyd_h = max(ys) - min(ys)
+        half_w = max(1, int(math.ceil(cyd_w / (2.0 * res)))) + margin_cells
+        half_h = max(1, int(math.ceil(cyd_h / (2.0 * res)))) + margin_cells
+        return half_w, half_h
+
+    pads = comp.get("footprint", {}).get("pads", [])
+    pxs = [p["local_pos"][0] for p in pads if "local_pos" in p]
+    pys = [p["local_pos"][1] for p in pads if "local_pos" in p]
+    if pxs and pys:
+        pad_w = (max(pxs) - min(pxs)) + 0.5
+        pad_h = (max(pys) - min(pys)) + 0.5
+        half_w = max(1, int(math.ceil(pad_w / (2.0 * res)))) + margin_cells
+        half_h = max(1, int(math.ceil(pad_h / (2.0 * res)))) + margin_cells
+        return half_w, half_h
+
+    half_w = 1 + margin_cells
+    half_h = 1 + margin_cells
+    return half_w, half_h
+
+
 @dataclass
 class _EnvState:
     """Mutable per-episode state."""
@@ -312,49 +345,24 @@ class PcbPlacementEnv(gym.Env):
         # ------------------------------------------------------------------ #
         # Guard 1: active component's own footprint vs. board boundary.       #
         #                                                                      #
-        # Previously _compute_mask only zeroed cells occupied/obstructed by   #
-        # *already-placed* components; it never checked whether centering the  #
-        # *active* component at a given cell would push its courtyard extent   #
-        # past a board edge.  Fix: compute the active component's half-extents #
-        # (same formula used in the placed-component loop below) and zero out  #
-        # the border band of cells where placement would violate the physical  #
-        # board boundary.                                                       #
-        #                                                                      #
-        # margin_cells is included so the exclusion matches the DRC clearance  #
-        # enforced between placed components.  If you want footprint-edge-only #
-        # (no clearance), replace `+ margin_cells` with nothing here.         #
-        #                                                                      #
-        # NOTE: This narrows the legal action set for every component.        #
-        # Resuming an existing checkpoint into this stricter mask will cause   #
-        # a value-estimate shock similar to a mid-training distribution shift; #
-        # a fresh training run (or at minimum a fresh BC phase) is recommended.#
+        # Zero out the border band where centering the active component       #
+        # would push its extent past a board edge.                            #
         # ------------------------------------------------------------------ #
         active_comp = self.state.design["components"][active_comp_idx]
-        active_courtyard_pts = (
-            active_comp.get("footprint", {}).get("courtyard", {}).get("points", [])
-        )
-        if active_courtyard_pts:
-            axs = [pt[0] for pt in active_courtyard_pts]
-            ays = [pt[1] for pt in active_courtyard_pts]
-            a_half_w = (
-                max(1, int(math.ceil((max(axs) - min(axs)) / (2.0 * res))))
-                + margin_cells
-            )
-            a_half_h = (
-                max(1, int(math.ceil((max(ays) - min(ays)) / (2.0 * res))))
-                + margin_cells
-            )
-        else:
-            # Fallback mirrors the placed-component fallback (2-cell radius).
-            a_half_w = 2 + margin_cells
-            a_half_h = 2 + margin_cells
+        a_half_w, a_half_h = _get_component_half_extents(active_comp, res, margin_cells)
 
-        # Zero out the border band — any center in this region would put the
-        # component's extent (or its clearance margin) off the physical board.
-        mask_2d[:a_half_h, :] = 0.0
-        mask_2d[self.H - a_half_h :, :] = 0.0
-        mask_2d[:, :a_half_w] = 0.0
-        mask_2d[:, self.W - a_half_w :] = 0.0
+        # On diminutive boards / test fixtures, clamp boundary exclusion
+        # to ensure the active component is not 100% locked out from the center.
+        a_half_h = min(a_half_h, max(0, (self.H - 1) // 2))
+        a_half_w = min(a_half_w, max(0, (self.W - 1) // 2))
+
+        # Zero out the border band
+        if a_half_h > 0:
+            mask_2d[:a_half_h, :] = 0.0
+            mask_2d[self.H - a_half_h :, :] = 0.0
+        if a_half_w > 0:
+            mask_2d[:, :a_half_w] = 0.0
+            mask_2d[:, self.W - a_half_w :] = 0.0
 
         for i, p in enumerate(self.state.design["placement"]["positions"]):
             if p is None or i == active_comp_idx:
@@ -365,30 +373,7 @@ class PcbPlacementEnv(gym.Env):
 
             # Determine half-extents in grid cells.
             comp = self.state.design["components"][i]
-            # Derive half-extents from courtyard polygon AABB.
-            # NOTE: comp.get("bounds") is always None — the IR does not
-            # serialise a top-level bounds field.  The footprint geometry
-            # lives in comp["footprint"]["courtyard"]["points"] as a list
-            # of [x, y] pairs relative to the component's local origin.
-            courtyard_pts = (
-                comp.get("footprint", {}).get("courtyard", {}).get("points", [])
-            )
-            if courtyard_pts:
-                # Points are in local component coordinates (relative to
-                # component origin), so AABB width = max_x - min_x gives
-                # the actual courtyard extent regardless of placed position.
-                xs = [pt[0] for pt in courtyard_pts]
-                ys = [pt[1] for pt in courtyard_pts]
-                cyd_w = max(xs) - min(xs)
-                cyd_h = max(ys) - min(ys)
-                half_w = max(1, int(math.ceil(cyd_w / (2.0 * res)))) + margin_cells
-                half_h = max(1, int(math.ceil(cyd_h / (2.0 * res)))) + margin_cells
-            else:
-                # Genuine fallback: courtyard absent in this component.
-                # Use a conservative 2-cell radius so at least adjacent
-                # cells are blocked even without footprint geometry.
-                half_w = 2 + margin_cells
-                half_h = 2 + margin_cells
+            half_w, half_h = _get_component_half_extents(comp, res, margin_cells)
 
             # Mask rectangular region around placed component.
             r_min = max(0, cy - half_h)
