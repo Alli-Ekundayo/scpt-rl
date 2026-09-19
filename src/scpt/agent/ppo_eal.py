@@ -718,6 +718,9 @@ class PPOEALTrainer:
         total_policy_loss = 0.0
         total_value_loss = 0.0
 
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         # ------------------------------------------------------------------
         # PPO epochs
         # ------------------------------------------------------------------
@@ -864,6 +867,9 @@ class PPOEALTrainer:
         # Dual update (once per outer iteration)
         # ------------------------------------------------------------------
         self.dual_updater.update(phi_c_estimates)
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         return {
             "reward_mean": float(torch.tensor(self.buffer.rewards, device=self.device).mean()),

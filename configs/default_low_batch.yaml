@@ -74,7 +74,7 @@ ppo:
   # Default in code is lr/5; override here for explicit control.
   constraint_critic_lr: 6.0e-5
   epochs: 4
-  minibatch_size: 32  # Reduced from 64 to 32
+  minibatch_size: 16  # Reduced to 16 for low memory footprint
 
   sigma: 1.0
 

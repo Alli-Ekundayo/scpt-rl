@@ -26,6 +26,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
 
 
 class SCPTPolicy(nn.Module):
@@ -149,21 +150,38 @@ class SCPTPolicy(nn.Module):
         # allocations in the FFN layers.
         # Because queries only cross-attend to placed components (K, V) and have
         # no inter-query self-attention, chunking along L is numerically exact.
+        #
+        # Activation Checkpointing: when autograd is enabled (e.g. during PPO
+        # update), each chunk is processed with torch.utils.checkpoint.checkpoint.
+        # This prevents autograd from holding intermediate activations across
+        # all chunks simultaneously in GPU memory (which accumulated to 14.3 GiB
+        # across ~225 chunks), keeping peak activation memory bounded to a
+        # single chunk (< 20 MiB).
         if self.max_query_tokens is not None and (B * L) > self.max_query_tokens:
             chunk_L = max(1, self.max_query_tokens // B)
             logits_chunks = []
+            use_cp = torch.is_grad_enabled()
+
+            def _chunk_fwd(q_chunk, m_chunk, K_in, V_in):
+                H_c = self.query_proj(q_chunk)
+                for layer in self.attn_layers:
+                    H_c = layer(H_c, K_in, V_in, kv_mask=kv_mask)
+                l_c = self.logit_head(H_c).squeeze(-1)
+                ill = m_chunk < 0.5
+                return l_c.masked_fill(ill, float("-inf"))
+
             for start in range(0, L, chunk_L):
                 end = min(start + chunk_L, L)
                 L_chunk = end - start
                 z_b = z_star.unsqueeze(1).expand(B, L_chunk, -1)
                 q_in = torch.cat([z_b, grid_xy[:, start:end]], dim=-1)
-                H_chunk = self.query_proj(q_in)
-                for layer in self.attn_layers:
-                    H_chunk = layer(H_chunk, K, V, kv_mask=kv_mask)
-                l_chunk = self.logit_head(H_chunk).squeeze(-1)
-                m_chunk = action_mask[:, start:end]
-                ill = m_chunk < 0.5
-                l_chunk = l_chunk.masked_fill(ill, float("-inf"))
+                m_in = action_mask[:, start:end]
+                if use_cp:
+                    l_chunk = checkpoint.checkpoint(
+                        _chunk_fwd, q_in, m_in, K, V, use_reentrant=False
+                    )
+                else:
+                    l_chunk = _chunk_fwd(q_in, m_in, K, V)
                 logits_chunks.append(l_chunk)
             return torch.cat(logits_chunks, dim=-1)
 
